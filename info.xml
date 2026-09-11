@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<extension key="com.skvare.collationfix" type="module">
+  <file>collationfix</file>
+  <name>Collation Fix - utf8mb4 Conversion Toolkit</name>
+  <description>Audits every InnoDB table for utf8/utf8mb3 collations, shows per-column diffs and generated ALTER statements in a review UI, and converts selected tables to utf8mb4 through a queue with progress tracking and a full audit log. Dry run by default.</description>
+  <license>AGPL-3.0</license>
+  <maintainer>
+    <author>Skvare</author>
+    <email>info@skvare.com</email>
+  </maintainer>
+  <authors>
+    <author>
+      <name>Skvare</name>
+      <email>info@skvare.com</email>
+      <role>Maintainer</role>
+    </author>
+  </authors>
+  <urls>
+    <url desc="Main Extension Page">https://github.com/Skvare/com.skvare.collationfix</url>
+    <url desc="Documentation">https://github.com/Skvare/com.skvare.collationfix</url>
+    <url desc="Support">https://skvare.com</url>
+    <url desc="Licensing">https://www.gnu.org/licenses/agpl-3.0.html</url>
+  </urls>
+  <releaseDate>2026-08-02</releaseDate>
+  <version>1.0.0</version>
+  <develStage>alpha</develStage>
+  <compatibility>
+    <ver>5.75</ver>
+  </compatibility>
+  <comments>Careful, auditable alternative to the blunt System.utf8conversion API. Analyze first, convert only what you approve.</comments>
+  <classloader>
+    <psr0 prefix="CRM_" path="."/>
+    <psr4 prefix="Civi\" path="Civi"/>
+  </classloader>
+  <civix>
+    <namespace>CRM/Collationfix</namespace>
+    <format>25.01.1</format>
+    <angularModule>crmCollationfix</angularModule>
+  </civix>
+  <mixins>
+    <mixin>menu-xml@1.0.0</mixin>
+    <mixin>mgd-php@1.0.0</mixin>
+    <mixin>setting-php@1.0.0</mixin>
+    <mixin>smarty@1.0.3</mixin>
+  </mixins>
+</extension>

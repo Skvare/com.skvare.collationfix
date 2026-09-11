@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<menu>
+  <item>
+    <path>civicrm/admin/collationfix</path>
+    <page_callback>CRM_Collationfix_Page_Analysis</page_callback>
+    <title>Collation Fix - utf8mb4 Conversion</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+  <item>
+    <path>civicrm/admin/collationfix/convert</path>
+    <page_callback>CRM_Collationfix_Form_Convert</page_callback>
+    <title>Confirm Conversion</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+  <item>
+    <path>civicrm/admin/collationfix/download</path>
+    <page_callback>CRM_Collationfix_Page_Download</page_callback>
+    <title>Download Conversion SQL</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+  <item>
+    <path>civicrm/admin/collationfix/log</path>
+    <page_callback>CRM_Collationfix_Page_Log</page_callback>
+    <title>Collation Fix - Conversion Log</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+</menu>
