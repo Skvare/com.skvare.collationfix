@@ -20,6 +20,11 @@ alternative:
   Review the exact ALTER statement for every table before anything runs.
 * **Pre-flight warnings** — large tables (lock duration), indexed
   `varchar(191+)` columns (index prefix limits).
+* **Server context at a glance** — database name, MySQL/MariaDB flavor and
+  version, and the server variables that matter for a safe conversion
+  (`character_set_server`, `collation_server`, `innodb_file_per_table`,
+  `innodb_large_prefix`, `innodb_default_row_format`, `max_allowed_packet`)
+  are shown right on the analysis page.
 * **Queue-based execution** — one table per task via `CRM_Queue` with a
   progress bar; a timeout on one giant table cannot leave the run half-done.
 * **Audit log** — every statement, its duration, before/after collation,
@@ -52,7 +57,16 @@ lag on replicated setups.
 
 ## Scope / Known Issues
 
-* Converts the CiviCRM database only (not the Drupal/WordPress database).
+* Operates on whatever database `CIVICRM_DSN` connects to — **every InnoDB
+  table in that database**, not just `civicrm_*` ones. On the common
+  Drupal/WordPress setup where the CMS and CiviCRM share a single database,
+  the CMS's own tables (`users`, `node`, `sessions`, etc.) will also appear
+  in the analysis and can be selected for conversion. Only CiviCRM's own
+  tables are excluded if CiviCRM is configured with a genuinely separate
+  DSN. Review the table list before converting on a shared database.
+* Only analyzes tables using the `InnoDB` engine; tables on other engines
+  (e.g. `MyISAM`/`Aria`) are not listed here and are not converted, even if
+  they are still on a legacy utf8 collation.
 * Converts the utf8 family only (`utf8`, `utf8mb3`, and normalizes other
   `utf8mb4_*` variants to `utf8mb4_unicode_ci`); latin1 and other charsets
   are left untouched.
