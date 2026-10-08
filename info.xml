@@ -2,7 +2,7 @@
 <extension key="com.skvare.collationfix" type="module">
   <file>collationfix</file>
   <name>Collation Fix - utf8mb4 Conversion Toolkit</name>
-  <description>Audits every InnoDB table for utf8/utf8mb3 collations, shows per-column diffs and generated ALTER statements in a review UI, and converts selected tables to utf8mb4 through a queue with progress tracking and a full audit log. Dry run by default.</description>
+  <description>Audits every civicrm_* InnoDB table for utf8/utf8mb3 collations, shows per-column diffs and generated ALTER statements in a review UI, and converts selected tables to utf8mb4 through a queue with progress tracking and a full audit log. Dry run by default.</description>
   <license>AGPL-3.0</license>
   <maintainer>
     <author>Skvare</author>

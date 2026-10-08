@@ -4,7 +4,8 @@
   <div class="messages status no-popup">
     <p>
       {ts}Database{/ts}: <strong>{$databaseName|escape}</strong> &nbsp;|&nbsp;
-      {ts}Server{/ts}: <strong>{$serverVersion|escape}</strong>{if $isMariaDb} ({ts}MariaDB{/ts}){else} ({ts}MySQL{/ts}){/if}
+      {ts}Server{/ts}: <strong>{$serverVersion|escape}</strong>{if $isMariaDb} ({ts}MariaDB{/ts}){else} ({ts}MySQL{/ts}){/if} &nbsp;|&nbsp;
+      {ts}Target collation{/ts}: <strong>{$targetCollation|escape}</strong> (<a href="{$settingsUrl}">{ts}change{/ts}</a>)
     </p>
     {if $serverDetails}
       <p class="description">

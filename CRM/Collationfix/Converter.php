@@ -96,10 +96,26 @@ class CRM_Collationfix_Converter {
       $log['error_message'] = $e->getMessage();
     }
 
-    // Verify post-conversion collation.
+    // Verify the post-conversion state by re-analyzing the table, so column
+    // collations are checked as well as the table default. A successful ALTER
+    // that still leaves columns (or the default) off target is an error.
     try {
-      $tables = $analyzer->getTables();
-      $log['collation_after'] = $tables[$table]['Collation'] ?? '';
+      $after = $analyzer->analyzeTable($table);
+      $log['collation_after'] = $after['current_collation'];
+      $remaining = [];
+      foreach ($after['columns'] as $col) {
+        $remaining[] = "{$col['field']} ({$col['current_collation']})";
+      }
+      foreach ($after['skipped_columns'] as $col) {
+        $remaining[] = "{$col['field']} ({$col['reason']})";
+      }
+      if ($log['status'] === 'success' && ($remaining || $after['needs_change'])) {
+        $log['status'] = 'error';
+        $log['error_message'] = E::ts('The ALTER ran, but verification found the table is not fully converted. Table collation: %1. Unconverted columns: %2', [
+          1 => $after['current_collation'],
+          2 => $remaining ? implode(', ', $remaining) : E::ts('none'),
+        ]);
+      }
     }
     catch (Exception $e) {
       // Non-fatal.

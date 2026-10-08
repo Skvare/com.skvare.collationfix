@@ -15,9 +15,10 @@ use CRM_Collationfix_ExtensionUtil as E;
 class CRM_Collationfix_Analyzer {
 
   const NEW_CHARSET = 'utf8mb4';
-  const NEW_COLLATION = 'utf8mb4_unicode_ci';
+  const DEFAULT_COLLATION = 'utf8mb4_unicode_ci';
   const NEW_BINARY_COLLATION = 'utf8mb4_bin';
   const CIVICRM_TABLE_PREFIX = 'civicrm\\_';
+  const TARGET_COLLATION_SETTING = 'collationfix_target_collation';
 
   /**
    * Table size (in bytes) above which a "large table" warning is raised.
@@ -29,9 +30,17 @@ class CRM_Collationfix_Analyzer {
    */
   protected $database;
 
+  /**
+   * Collation that non-binary utf8 columns and table defaults convert to.
+   *
+   * @var string
+   */
+  protected $targetCollation;
+
   public function __construct() {
     $dsn = defined('CIVICRM_DSN') ? CIVICRM_DSN : NULL;
     $this->database = CRM_Core_DAO::getDatabaseName();
+    $this->targetCollation = self::resolveTargetCollation();
   }
 
   /**
@@ -41,6 +50,56 @@ class CRM_Collationfix_Analyzer {
    */
   public function getDatabaseName() {
     return $this->database;
+  }
+
+  /**
+   * @return string
+   */
+  public function getTargetCollation() {
+    return $this->targetCollation;
+  }
+
+  /**
+   * Read the target collation setting, falling back to the default when it
+   * is unset or not a valid option on this server. The value is interpolated
+   * into ALTER statements, so it is never used unvalidated.
+   *
+   * @return string
+   */
+  protected static function resolveTargetCollation() {
+    $collation = (string) Civi::settings()->get(self::TARGET_COLLATION_SETTING);
+    return isset(self::getTargetCollationOptions()[$collation]) ? $collation : self::DEFAULT_COLLATION;
+  }
+
+  /**
+   * Options for the target collation setting: every non-binary utf8mb4
+   * collation the server supports. Binary collations are excluded because
+   * _bin columns always map to utf8mb4_bin, and a binary table default would
+   * make every text comparison case-sensitive.
+   *
+   * @return array
+   */
+  public static function getTargetCollationOptions() {
+    $options = [];
+    $dao = CRM_Core_DAO::executeQuery("SHOW COLLATION WHERE Charset = 'utf8mb4'");
+    while ($dao->fetch()) {
+      if (substr($dao->Collation, -4) !== '_bin') {
+        $options[$dao->Collation] = $dao->Collation;
+      }
+    }
+    ksort($options);
+    return $options;
+  }
+
+  /**
+   * Setting validate_callback for the target collation.
+   *
+   * @param mixed $value
+   *
+   * @return bool
+   */
+  public static function validateTargetCollation(&$value) {
+    return is_string($value) && isset(self::getTargetCollationOptions()[$value]);
   }
 
   /**
@@ -149,7 +208,7 @@ class CRM_Collationfix_Analyzer {
       'table' => $table,
       'engine' => $meta['Engine'],
       'current_collation' => $meta['Collation'],
-      'target_collation' => self::NEW_COLLATION,
+      'target_collation' => $this->targetCollation,
       'columns' => [],
       'skipped_columns' => [],
       'warnings' => [],
@@ -167,7 +226,7 @@ class CRM_Collationfix_Analyzer {
       $extra = (string) $dao->Extra;
 
       // No collation (numeric/blob/etc.) or already at a target collation.
-      if (!$collation || $collation === self::NEW_COLLATION || $collation === self::NEW_BINARY_COLLATION) {
+      if (!$collation || $collation === $this->targetCollation || $collation === self::NEW_BINARY_COLLATION) {
         continue;
       }
 
@@ -179,7 +238,7 @@ class CRM_Collationfix_Analyzer {
       // Preserve binary collations as binary.
       $columnCollation = (strpos($collation, '_bin') !== FALSE)
         ? self::NEW_BINARY_COLLATION
-        : self::NEW_COLLATION;
+        : $this->targetCollation;
 
       $null = ($dao->Null === 'YES') ? 'NULL' : 'NOT NULL';
       $comment = str_replace("'", "''", (string) $dao->Comment);
@@ -245,7 +304,7 @@ class CRM_Collationfix_Analyzer {
     $tableIsUtf8 = $this->isUtf8Collation($meta['Collation']);
     $tableCollation = (strpos((string) $meta['Collation'], '_bin') !== FALSE)
       ? self::NEW_BINARY_COLLATION
-      : self::NEW_COLLATION;
+      : $this->targetCollation;
     $item['target_collation'] = $tableIsUtf8 ? $tableCollation : $meta['Collation'];
 
     if (empty($modifyClauses) && (!$tableIsUtf8 || $meta['Collation'] === $tableCollation)) {
@@ -257,7 +316,7 @@ class CRM_Collationfix_Analyzer {
     if ($tableIsUtf8) {
       // Stay binary only when the table itself is currently on a binary
       // collation. A single binary column (e.g. a hash) must not flip the
-      // table default - CiviCRM core tables keep it at unicode_ci.
+      // table default - CiviCRM core tables keep it at the target collation.
       $lines[] = 'CHARACTER SET = ' . self::NEW_CHARSET . " COLLATE = {$tableCollation}" .
         ($meta['Engine'] === 'InnoDB' ? ' ROW_FORMAT = Dynamic KEY_BLOCK_SIZE = 0' : '');
     }
@@ -342,7 +401,7 @@ class CRM_Collationfix_Analyzer {
       SELECT TABLE_NAME, (DATA_LENGTH + INDEX_LENGTH) AS size_bytes, TABLE_ROWS
       FROM information_schema.TABLES
       WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "'
+        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
         AND ENGINE = 'InnoDB'
     ");
     while ($dao->fetch()) {
@@ -370,7 +429,7 @@ class CRM_Collationfix_Analyzer {
         AND c.TABLE_NAME = s.TABLE_NAME
         AND c.COLUMN_NAME = s.COLUMN_NAME
       WHERE s.TABLE_SCHEMA = DATABASE()
-        AND s.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "'
+        AND s.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
         AND c.DATA_TYPE = 'varchar'
         AND c.CHARACTER_MAXIMUM_LENGTH > 191
         AND c.CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')
@@ -395,7 +454,7 @@ class CRM_Collationfix_Analyzer {
       SELECT COUNT(*)
       FROM information_schema.TABLES
       WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "'
+        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
         AND ENGINE = 'InnoDB'
         AND (TABLE_COLLATION LIKE 'utf8\_%' OR TABLE_COLLATION LIKE 'utf8mb3\_%')
     ");

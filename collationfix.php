@@ -50,7 +50,7 @@ function collationfix_civicrm_enable(): void {
 /**
  * Implements hook_civicrm_navigationMenu().
  *
- * Adds "Collation Fix" under Administer > System Settings.
+ * Adds "Collation Fix" and its settings page under Administer > System Settings.
  *
  * @link https://docs.civicrm.org/dev/en/latest/hooks/hook_civicrm_navigationMenu
  */
@@ -63,7 +63,30 @@ function collationfix_civicrm_navigationMenu(&$menu): void {
     'operator' => 'OR',
     'separator' => 0,
   ]);
+  _collationfix_civix_insert_navigation_menu($menu, 'Administer/System Settings', [
+    'label' => E::ts('Collation Fix Settings'),
+    'name' => 'collationfix_settings',
+    'url' => 'civicrm/admin/setting/collationfix?reset=1',
+    'permission' => 'administer CiviCRM',
+    'operator' => 'OR',
+    'separator' => 0,
+  ]);
   _collationfix_civix_navigationMenu($menu);
+}
+
+/**
+ * Implements hook_civicrm_buildForm().
+ *
+ * Makes the target collation list on the settings page searchable.
+ *
+ * @link https://docs.civicrm.org/dev/en/latest/hooks/hook_civicrm_buildForm
+ */
+function collationfix_civicrm_buildForm($formName, &$form): void {
+  if ($form instanceof CRM_Admin_Form_Generic && $form->getSettingPageFilter() === 'collationfix') {
+    // addScript() defaults to the page-footer region, which renders after the
+    // form markup on both full page loads and AJAX snippets.
+    Civi::resources()->addScript("CRM.$('#collationfix_target_collation').select2();");
+  }
 }
 
 /**

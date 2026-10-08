@@ -19,6 +19,12 @@
     <access_arguments>administer CiviCRM</access_arguments>
   </item>
   <item>
+    <path>civicrm/admin/setting/collationfix</path>
+    <page_callback>CRM_Admin_Form_Generic</page_callback>
+    <title>Collation Fix Settings</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+  <item>
     <path>civicrm/admin/collationfix/log</path>
     <page_callback>CRM_Collationfix_Page_Log</page_callback>
     <title>Collation Fix - Conversion Log</title>

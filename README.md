@@ -1,7 +1,7 @@
 # Collation Fix — utf8mb4 Conversion Toolkit (com.skvare.collationfix)
 
-Audits every InnoDB table in the CiviCRM database for legacy `utf8` /
-`utf8mb3` collations, shows exactly what would change (per column), and
+Audits every `civicrm_*` InnoDB table in the CiviCRM database for legacy
+`utf8` / `utf8mb3` collations, shows exactly what would change (per column), and
 converts selected tables to `utf8mb4` through a queue with progress tracking
 and a permanent audit log.
 
@@ -29,6 +29,8 @@ alternative:
   progress bar; a timeout on one giant table cannot leave the run half-done.
 * **Audit log** — every statement, its duration, before/after collation,
   outcome, and the operator are recorded in `civicrm_collationfix_log`.
+  After each ALTER the table is re-analyzed, and any column (or table
+  default) still off the target collation marks the run as an error.
 * **System status check** — warns on the CiviCRM status page while any
   tables remain on 3-byte utf8.
 
@@ -42,12 +44,18 @@ This is an [extension for CiviCRM](https://docs.civicrm.org/sysadmin/en/latest/c
 1. Install and enable the extension.
 2. Go to **Administer → System Settings → Collation Fix (utf8mb4)** or visit
    `civicrm/admin/collationfix`.
-3. Review the analysis: expand any table to see the per-column diff and the
+3. Optionally pick the **target collation** (default `utf8mb4_unicode_ci`)
+   at **Administer → System Settings → Collation Fix Settings**
+   (`civicrm/admin/setting/collationfix`) or via the *change* link on the
+   analysis page. The list shows the non-binary
+   `utf8mb4` collations your server supports; `_bin` columns always become
+   `utf8mb4_bin`.
+4. Review the analysis: expand any table to see the per-column diff and the
    exact ALTER statement. Warnings are shown for large tables and risky
    indexes.
-4. Either download the statements as a `.sql` file to run manually, or select
+5. Either download the statements as a `.sql` file to run manually, or select
    tables and click **Review and convert selected tables**.
-5. On the confirmation screen, type the database name to enable execution.
+6. On the confirmation screen, type the database name to enable execution.
    The conversion runs as a queue with a progress bar and lands on the
    conversion log when done.
 
@@ -57,19 +65,18 @@ lag on replicated setups.
 
 ## Scope / Known Issues
 
-* Operates on whatever database `CIVICRM_DSN` connects to — **every InnoDB
-  table in that database**, not just `civicrm_*` ones. On the common
-  Drupal/WordPress setup where the CMS and CiviCRM share a single database,
-  the CMS's own tables (`users`, `node`, `sessions`, etc.) will also appear
-  in the analysis and can be selected for conversion. Only CiviCRM's own
-  tables are excluded if CiviCRM is configured with a genuinely separate
-  DSN. Review the table list before converting on a shared database.
+* Operates on the database `CIVICRM_DSN` connects to, and only on tables
+  whose names start with `civicrm_`. On a shared Drupal/WordPress database
+  the CMS's own tables (`users`, `node`, `sessions`, etc.) are not listed or
+  converted. Neither are CiviCRM detailed-logging tables (`log_civicrm_*`)
+  or extension tables that use another prefix (e.g. CiviRules'
+  `civirule_*`). Convert those separately if needed.
 * Only analyzes tables using the `InnoDB` engine; tables on other engines
   (e.g. `MyISAM`/`Aria`) are not listed here and are not converted, even if
   they are still on a legacy utf8 collation.
 * Converts the utf8 family only (`utf8`, `utf8mb3`, and normalizes other
-  `utf8mb4_*` variants to `utf8mb4_unicode_ci`); latin1 and other charsets
-  are left untouched.
+  `utf8mb4_*` variants to the configured target collation); latin1 and
+  other charsets are left untouched.
 * Schema conversion only — it does not repair mojibake or double-encoded
   data.
 * `NOT NULL` is not re-emitted on generated columns (MariaDB rejects the
