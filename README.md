@@ -31,6 +31,9 @@ alternative:
   outcome, and the operator are recorded in `civicrm_collationfix_log`.
   After each ALTER the table is re-analyzed, and any column (or table
   default) still off the target collation marks the run as an error.
+* **Command-line API** — `Collationfix.convert` converts one or more tables
+  from `cv`, `drush` or `wp-cli`, so large tables are never cut off by a web
+  request timeout. Same verification and audit log as the UI.
 * **System status check** — warns on the CiviCRM status page while any
   tables remain on 3-byte utf8.
 
@@ -58,6 +61,34 @@ This is an [extension for CiviCRM](https://docs.civicrm.org/sysadmin/en/latest/c
 6. On the confirmation screen, type the database name to enable execution.
    The conversion runs as a queue with a progress bar and lands on the
    conversion log when done.
+
+## Command Line
+
+For large tables, convert from the command line instead of the browser. The
+`Collationfix.convert` API (APIv3) runs the tables one after another in the
+same process, with the same analysis, post-conversion verification and audit
+log as the UI queue.
+
+```sh
+# Preview the ALTER statements without running them.
+cv api Collationfix.convert tables=civicrm_contact,civicrm_activity dry_run=1
+
+# Convert. Pass --user so the audit log records who ran it.
+cv --user=admin api Collationfix.convert tables=civicrm_contact,civicrm_activity
+
+# Same API from drush (Drupal) or wp-cli (WordPress).
+drush civicrm-api Collationfix.convert tables=civicrm_contact
+wp civicrm api Collationfix.convert tables=civicrm_contact
+```
+
+* `tables` (required) — one or more `civicrm_*` InnoDB tables, as a
+  comma-separated string or an array. Every name is checked before anything
+  runs; an unknown name stops the whole call.
+* `dry_run` — return each table's generated statement, columns and warnings
+  without executing anything.
+* If any table fails, the call returns an error (non-zero exit from `cv`)
+  that still includes every table's result. The other tables are still
+  converted, as in the UI queue.
 
 **Take a database backup before converting.** Each ALTER rebuilds and locks
 its table; large tables can take several minutes and will cause replication
