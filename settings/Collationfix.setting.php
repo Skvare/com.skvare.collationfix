@@ -7,6 +7,7 @@ return [
     'name' => 'collationfix_target_collation',
     'type' => 'String',
     'html_type' => 'select',
+    'html_attributes' => ['class' => 'crm-select2'],
     'default' => 'utf8mb4_unicode_ci',
     'is_domain' => 1,
     'is_contact' => 0,

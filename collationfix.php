@@ -75,21 +75,6 @@ function collationfix_civicrm_navigationMenu(&$menu): void {
 }
 
 /**
- * Implements hook_civicrm_buildForm().
- *
- * Makes the target collation list on the settings page searchable.
- *
- * @link https://docs.civicrm.org/dev/en/latest/hooks/hook_civicrm_buildForm
- */
-function collationfix_civicrm_buildForm($formName, &$form): void {
-  if ($form instanceof CRM_Admin_Form_Generic && $form->getSettingPageFilter() === 'collationfix') {
-    // addScript() defaults to the page-footer region, which renders after the
-    // form markup on both full page loads and AJAX snippets.
-    Civi::resources()->addScript("CRM.$('#collationfix_target_collation').select2();");
-  }
-}
-
-/**
  * Implements hook_civicrm_check().
  *
  * Adds a system status warning when tables are not yet on utf8mb4.
