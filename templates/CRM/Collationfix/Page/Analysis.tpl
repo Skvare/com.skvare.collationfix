@@ -8,11 +8,22 @@
       {ts}Target collation{/ts}: <strong>{$targetCollation|escape}</strong> (<a href="{$settingsUrl}">{ts}change{/ts}</a>)
     </p>
     {if $serverDetails}
-      <p class="description">
-        {foreach from=$serverDetails key=name item=value name=sd}
-          <code>{$name|escape}</code>: {$value|escape}{if !$smarty.foreach.sd.last} &nbsp;|&nbsp; {/if}
-        {/foreach}
-      </p>
+      <table class="report-layout collationfix-server-details" style="width:auto; margin:0.5em 0;">
+        <thead>
+          <tr>
+            <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
+            <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {foreach from=$serverDetails key=name item=value name=sd}
+            {if $smarty.foreach.sd.iteration % 2 == 1}<tr>{/if}
+              <td><code>{$name|escape}</code> {help id=$name file="CRM/Collationfix/Page/Analysis" title=$name database=$databaseName collation=$targetCollation}</td>
+              <td>{$value|escape}</td>
+            {if $smarty.foreach.sd.iteration % 2 == 0}</tr>{elseif $smarty.foreach.sd.last}<td></td><td></td></tr>{/if}
+          {/foreach}
+        </tbody>
+      </table>
     {/if}
     <p>{ts}Dry run by default: nothing on this page modifies the database. Statements are only executed from the conversion screen after explicit confirmation.{/ts}</p>
   </div>
@@ -25,6 +36,20 @@
       <td><strong>{ts}Data size affected{/ts}</strong><br/><span style="font-size:1.6em;">{$totalSize}</span></td>
     </tr>
   </table>
+
+  {if $uncoveredTables}
+    <div class="messages warning no-popup">
+      <p>{ts 1=$uncoveredTables|@count}%1 CiviCRM tables outside this tool's scope still use 3-byte utf8. They are not listed below and are not converted; convert them separately.{/ts}</p>
+      <details>
+        <summary>{ts}Show tables{/ts}</summary>
+        <ul>
+          {foreach from=$uncoveredTables key=table item=info}
+            <li><code>{$table|escape}</code> ({$info.engine|escape}, {$info.collation|escape}): {$info.reason|escape}</li>
+          {/foreach}
+        </ul>
+      </details>
+    </div>
+  {/if}
 
   <div style="margin-bottom:0.5em;">
     <label>
@@ -52,7 +77,7 @@
         {foreach from=$analysis key=table item=item}
           <tr class="collationfix-row {if !$item.needs_change}collationfix-ok{/if} {cycle values='odd-row,even-row'}">
             <td>
-              {if $item.needs_change}
+              {if $item.needs_change and !$item.blocked}
                 <input type="checkbox" name="tables[]" value="{$table|escape}" class="collationfix-check" checked/>
               {/if}
             </td>
@@ -62,7 +87,9 @@
             <td>{$item.columns|@count}</td>
             <td>{$item.size_formatted|escape}</td>
             <td>
-              {if !$item.needs_change}
+              {if $item.blocked}
+                <span class="crm-tag-item" style="background:#fdd;">{ts}Blocked{/ts}</span>
+              {elseif !$item.needs_change}
                 <span class="crm-tag-item" style="background:#dfe;">{ts}OK{/ts}</span>
               {elseif $item.warnings}
                 <span class="crm-tag-item" style="background:#fdd;">{ts}Warning{/ts}</span>
@@ -80,6 +107,13 @@
             <tr id="collationfix-detail-{$table|escape}" class="collationfix-detail" style="display:none;">
               <td></td>
               <td colspan="7">
+                {if $item.errors}
+                  <div class="messages error no-popup">
+                    {foreach from=$item.errors item=error}
+                      <p>{$error|escape}</p>
+                    {/foreach}
+                  </div>
+                {/if}
                 {if $item.warnings}
                   <div class="messages warning no-popup">
                     {foreach from=$item.warnings item=warning}
@@ -124,7 +158,9 @@
       <button type="submit" class="crm-button" {if !$totalNeedsChange}disabled{/if}>
         <i class="crm-i fa-play" aria-hidden="true"></i> {ts}Review and convert selected tables{/ts}
       </button>
-      <a class="button" href="{$downloadUrl}"><span><i class="crm-i fa-download" aria-hidden="true"></i> {ts}Download .sql{/ts}</span></a>
+      <button type="submit" class="crm-button" id="collationfix-download" formaction="{$downloadUrl}" {if !$totalNeedsChange}disabled{/if}>
+        <i class="crm-i fa-download" aria-hidden="true"></i> {ts}Download selected as .sql{/ts}
+      </button>
       <a class="button" href="{$logUrl}"><span><i class="crm-i fa-list" aria-hidden="true"></i> {ts}View conversion log{/ts}</span></a>
     </div>
   </form>
@@ -148,6 +184,13 @@
     $('.collationfix-toggle').on('click', function(e) {
       e.preventDefault();
       $('#' + $(this).data('target').replace(/([^A-Za-z0-9_-])/g, '\\$1')).toggle();
+    });
+
+    $('#collationfix-download').on('click', function() {
+      if (!$('.collationfix-check:checked').length) {
+        CRM.alert(ts('Select at least one table to download.'), '', 'error');
+        return false;
+      }
     });
 
     $('#collationfix-form').on('submit', function() {

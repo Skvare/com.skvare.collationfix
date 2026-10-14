@@ -77,7 +77,8 @@ function collationfix_civicrm_navigationMenu(&$menu): void {
 /**
  * Implements hook_civicrm_check().
  *
- * Adds a system status warning when tables are not yet on utf8mb4.
+ * Adds a system status warning when tables, or any of their columns, are not
+ * yet on utf8mb4.
  *
  * @link https://docs.civicrm.org/dev/en/latest/hooks/hook_civicrm_check
  */
@@ -95,7 +96,7 @@ function collationfix_civicrm_check(&$messages, $statusNames, $includeDisabled):
     $url = CRM_Utils_System::url('civicrm/admin/collationfix', 'reset=1');
     $messages[] = new CRM_Utils_Check_Message(
       'collationfixNonUtf8mb4',
-      E::ts('%1 database tables are not using the utf8mb4 character set. Emoji and other 4-byte characters cannot be stored in these tables. <a href="%2">Review and convert them with Collation Fix</a>.', [
+      E::ts('%1 database tables still use the 3-byte utf8 character set, as their default or in some of their columns. Emoji and other 4-byte characters cannot be stored in these tables. <a href="%2">Review and convert them with Collation Fix</a>.', [
         1 => $count,
         2 => $url,
       ]),

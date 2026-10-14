@@ -32,6 +32,8 @@
                 <span class="crm-tag-item" style="background:#dfe;">{ts}Success{/ts}</span>
               {elseif $row.status eq 'error'}
                 <span class="crm-tag-item" style="background:#fdd;" title="{$row.error_message|escape}">{ts}Error{/ts}</span>
+              {elseif $row.status eq 'running'}
+                <span class="crm-tag-item" style="background:#ffd;" title="{ts}Still running, or the request was interrupted before the result was recorded. If no conversion is in progress, check the analysis page to see whether this table was converted.{/ts}">{ts}Running / interrupted{/ts}</span>
               {else}
                 <span class="crm-tag-item" style="background:#eee;">{ts}Skipped{/ts}</span>
               {/if}

@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS `civicrm_collationfix_log` (
   `collation_before` varchar(64) DEFAULT NULL,
   `collation_after` varchar(64) DEFAULT NULL,
   `duration_ms` int unsigned DEFAULT 0 COMMENT 'Execution time in milliseconds',
-  `status` varchar(16) NOT NULL DEFAULT 'skipped' COMMENT 'success|error|skipped',
+  `status` varchar(16) NOT NULL DEFAULT 'skipped' COMMENT 'running|success|error|skipped',
   `error_message` text,
   `created_id` int unsigned DEFAULT NULL COMMENT 'FK to civicrm_contact of the operator',
   `created_date` datetime NOT NULL,

@@ -6,11 +6,13 @@ use CRM_Collationfix_ExtensionUtil as E;
  * Analyzes database tables/columns for utf8/utf8mb3 -> utf8mb4 conversion.
  *
  * Ported from Skvare's standalone conversion.php CLI script, with fixes:
- * - Does not quote CURRENT_TIMESTAMP / expression defaults.
- * - Escapes quotes inside DEFAULT values (not just COMMENT).
- * - Skips generated columns (plain MODIFY would fail on them).
+ * - Tells expression defaults from literal ones by how SHOW CREATE TABLE
+ *   writes them, so neither is rewritten as the other.
+ * - Escapes DEFAULT and COMMENT values with the connection's escaper.
+ * - Redefines generated columns with their generation expression, read
+ *   from SHOW CREATE TABLE.
  * - Handles both utf8_* (MySQL 5.7) and utf8mb3_* (MySQL 8) collation names.
- * - Adds size / index-length pre-flight warnings.
+ * - Adds size / index-key-length pre-flight warnings.
  */
 class CRM_Collationfix_Analyzer {
 
@@ -37,10 +39,35 @@ class CRM_Collationfix_Analyzer {
    */
   protected $targetCollation;
 
-  public function __construct() {
-    $dsn = defined('CIVICRM_DSN') ? CIVICRM_DSN : NULL;
+  /**
+   * @var string|null
+   */
+  protected $serverVersion;
+
+  /**
+   * @var array|null
+   */
+  protected $serverDetails;
+
+  /**
+   * @param string|null $targetCollation
+   *   Collation to convert to; defaults to the target collation setting. A
+   *   queued run passes the collation that was confirmed, so a setting change
+   *   mid-run cannot give its tables different collations.
+   *
+   * @throws CRM_Core_Exception
+   */
+  public function __construct($targetCollation = NULL) {
     $this->database = CRM_Core_DAO::getDatabaseName();
-    $this->targetCollation = self::resolveTargetCollation();
+    if ($targetCollation === NULL) {
+      $this->targetCollation = self::resolveTargetCollation();
+    }
+    elseif (self::validateTargetCollation($targetCollation)) {
+      $this->targetCollation = $targetCollation;
+    }
+    else {
+      throw new CRM_Core_Exception("Unsupported target collation: {$targetCollation}");
+    }
   }
 
   /**
@@ -108,7 +135,10 @@ class CRM_Collationfix_Analyzer {
    * @return string
    */
   public function getServerVersion() {
-    return (string) CRM_Core_DAO::singleValueQuery('SELECT VERSION()');
+    if ($this->serverVersion === NULL) {
+      $this->serverVersion = (string) CRM_Core_DAO::singleValueQuery('SELECT VERSION()');
+    }
+    return $this->serverVersion;
   }
 
   /**
@@ -119,21 +149,30 @@ class CRM_Collationfix_Analyzer {
   }
 
   /**
-   * Get server variables relevant to a utf8mb4 conversion (charset/collation
-   * defaults, InnoDB row-format/prefix settings, packet size). Variables that
-   * don't exist on this server/version (e.g. innodb_large_prefix was removed
-   * in newer MySQL/MariaDB) are simply omitted rather than erroring.
+   * Get server, database and connection variables relevant to a utf8mb4
+   * conversion (charset/collation defaults, InnoDB row-format/prefix/page
+   * settings, packet size). Variables that don't exist on this server/version
+   * (e.g. innodb_large_prefix was removed in newer MySQL/MariaDB) are simply
+   * omitted rather than erroring.
    *
    * @return array
    *   Variable name => value.
    */
   public function getServerDetails() {
+    if ($this->serverDetails !== NULL) {
+      return $this->serverDetails;
+    }
     $variables = [
       'character_set_server',
       'collation_server',
+      'character_set_database',
+      'collation_database',
+      'character_set_connection',
+      'collation_connection',
       'innodb_file_per_table',
       'innodb_large_prefix',
       'innodb_default_row_format',
+      'innodb_page_size',
       'max_allowed_packet',
     ];
     $details = [];
@@ -143,6 +182,7 @@ class CRM_Collationfix_Analyzer {
         $details[$name] = $dao->Value;
       }
     }
+    $this->serverDetails = $details;
     return $details;
   }
 
@@ -157,10 +197,13 @@ class CRM_Collationfix_Analyzer {
    *   - table, engine, current_collation, target_collation
    *   - size_bytes, size_formatted, row_count
    *   - columns: list of columns needing change
-   *   - skipped_columns: generated columns that were skipped
+   *   - skipped_columns: columns whose definitions cannot be converted safely
    *   - warnings: list of warning strings
+   *   - blocked, errors: whether conversion is unsafe, and the reasons
+   *   - schema_fingerprint: hash of DDL excluding its sequence counter
+   *   - row_format: row format the table will have after conversion
    *   - needs_change: bool
-   *   - alter: full ALTER statement (empty when needs_change is FALSE)
+   *   - alter: full ALTER statement (empty when blocked or no change is needed)
    */
   public function analyze($onlyTables = NULL) {
     $result = [];
@@ -212,15 +255,41 @@ class CRM_Collationfix_Analyzer {
       'columns' => [],
       'skipped_columns' => [],
       'warnings' => [],
+      'blocked' => FALSE,
+      'errors' => [],
+      'schema_fingerprint' => '',
+      'row_format' => (string) ($meta['Row_format'] ?? ''),
       'needs_change' => FALSE,
       'alter' => '',
     ];
 
     $modifyClauses = [];
     $generatedClauses = [];
-    $generationExpressions = NULL;
 
-    $dao = CRM_Core_DAO::executeQuery("SHOW FULL COLUMNS FROM `{$table}`");
+    // Capture the schema used for this analysis. Parse column definitions
+    // from this same snapshot only when a column needs conversion.
+    try {
+      $createTable = $this->getCreateTable($table);
+      $item['schema_fingerprint'] = self::fingerprint($createTable);
+    }
+    catch (Exception $e) {
+      $item['blocked'] = $item['needs_change'] = TRUE;
+      $item['errors'][] = $e->getMessage();
+      return $item;
+    }
+    $definitions = NULL;
+    $definitionOf = function ($field) use ($table, $createTable, &$definitions) {
+      if ($definitions === NULL) {
+        $definitions = $this->getColumnDefinitions($table, $createTable);
+      }
+      if (!isset($definitions[$field])) {
+        throw new CRM_Core_Exception(E::ts('Cannot parse the definition of column %1. Conversion blocked.', [1 => $field]));
+      }
+      return $definitions[$field];
+    };
+
+    $quotedTable = str_replace('`', '``', $table);
+    $dao = CRM_Core_DAO::executeQuery("SHOW FULL COLUMNS FROM `{$quotedTable}`");
     while ($dao->fetch()) {
       $collation = $dao->Collation;
       $extra = (string) $dao->Extra;
@@ -241,28 +310,37 @@ class CRM_Collationfix_Analyzer {
         : $this->targetCollation;
 
       $null = ($dao->Null === 'YES') ? 'NULL' : 'NOT NULL';
-      $comment = str_replace("'", "''", (string) $dao->Comment);
+      $comment = CRM_Core_DAO::escapeString((string) $dao->Comment);
+      $quotedField = str_replace('`', '``', $dao->Field);
+
+      try {
+        $definition = $definitionOf($dao->Field);
+        $default = $this->buildDefaultClause($dao->Default, $dao->Null, $definition);
+      }
+      catch (Exception $e) {
+        $item['errors'][] = $e->getMessage();
+        $item['skipped_columns'][] = ['field' => $dao->Field, 'reason' => $e->getMessage()];
+        continue;
+      }
 
       // Generated columns must be redefined with their generation expression,
       // otherwise they stay on the old charset and reject 4-byte input coming
       // from the columns they derive from.
       if (stripos($extra, 'GENERATED') !== FALSE && stripos($extra, 'DEFAULT_GENERATED') === FALSE) {
-        if ($generationExpressions === NULL) {
-          $generationExpressions = $this->getGenerationExpressions($table);
-        }
-        $expression = $generationExpressions[$dao->Field] ?? '';
+        $expression = (string) ($definition['generated'] ?? '');
         if ($expression === '') {
           $item['skipped_columns'][] = [
             'field' => $dao->Field,
-            'reason' => E::ts('Generated column - expression could not be read from information_schema.'),
+            'reason' => E::ts('Generated column - expression could not be read from SHOW CREATE TABLE.'),
           ];
+          $item['errors'][] = E::ts('Cannot read the generation expression for %1. Conversion blocked.', [1 => $dao->Field]);
           continue;
         }
         $storage = (stripos($extra, 'VIRTUAL') !== FALSE) ? 'VIRTUAL' : 'STORED';
         // Generated columns go last so their base columns convert first.
         // Note: no NULL/NOT NULL clause - MariaDB rejects it on generated
         // columns, and NULL is the default in both MySQL and MariaDB.
-        $generatedClauses[] = "MODIFY `{$dao->Field}` {$dao->Type} CHARACTER SET " . self::NEW_CHARSET .
+        $generatedClauses[] = "MODIFY `{$quotedField}` {$dao->Type} CHARACTER SET " . self::NEW_CHARSET .
           " COLLATE {$columnCollation} GENERATED ALWAYS AS ({$expression}) {$storage} COMMENT '{$comment}'";
         $item['columns'][] = [
           'field' => $dao->Field,
@@ -273,10 +351,9 @@ class CRM_Collationfix_Analyzer {
         continue;
       }
 
-      $default = $this->buildDefaultClause($dao->Default, $dao->Null, $extra);
       $extraSql = trim(str_ireplace('DEFAULT_GENERATED', '', $extra));
 
-      $clause = "MODIFY `{$dao->Field}` {$dao->Type} CHARACTER SET " . self::NEW_CHARSET .
+      $clause = "MODIFY `{$quotedField}` {$dao->Type} CHARACTER SET " . self::NEW_CHARSET .
         " COLLATE {$columnCollation} {$null}";
       if ($default !== '') {
         $clause .= " {$default}";
@@ -307,6 +384,18 @@ class CRM_Collationfix_Analyzer {
       : $this->targetCollation;
     $item['target_collation'] = $tableIsUtf8 ? $tableCollation : $meta['Collation'];
 
+    // InnoDB tables move to the Dynamic row format for its 3072-byte index
+    // key limit. Compressed tables already have that limit, and switching
+    // them would silently decompress them.
+    $setDynamic = $tableIsUtf8 && $meta['Engine'] === 'InnoDB'
+      && strcasecmp((string) ($meta['Row_format'] ?? ''), 'Compressed') !== 0;
+    $item['row_format'] = $setDynamic ? 'Dynamic' : (string) ($meta['Row_format'] ?? '');
+
+    if ($item['errors']) {
+      $item['blocked'] = $item['needs_change'] = TRUE;
+      return $item;
+    }
+
     if (empty($modifyClauses) && (!$tableIsUtf8 || $meta['Collation'] === $tableCollation)) {
       return $item;
     }
@@ -318,63 +407,195 @@ class CRM_Collationfix_Analyzer {
       // collation. A single binary column (e.g. a hash) must not flip the
       // table default - CiviCRM core tables keep it at the target collation.
       $lines[] = 'CHARACTER SET = ' . self::NEW_CHARSET . " COLLATE = {$tableCollation}" .
-        ($meta['Engine'] === 'InnoDB' ? ' ROW_FORMAT = Dynamic KEY_BLOCK_SIZE = 0' : '');
+        ($setDynamic ? ' ROW_FORMAT = Dynamic KEY_BLOCK_SIZE = 0' : '');
     }
-    $item['alter'] = "ALTER TABLE `{$table}`\n  " . implode(",\n  ", $lines) . ';';
+    $item['alter'] = "ALTER TABLE `{$quotedTable}`\n  " . implode(",\n  ", $lines) . ';';
 
     return $item;
   }
 
   /**
-   * Build the DEFAULT clause for a column, handling expression defaults.
+   * Build the DEFAULT clause for a column.
+   *
+   * Only string columns get here (TIMESTAMP/DATETIME have no collation).
+   * Whether a default is a literal or an expression comes from how SHOW
+   * CREATE TABLE writes it, never from its text: a literal default may well
+   * read "CURRENT_TIMESTAMP".
    *
    * @param string|null $default
+   *   Default from SHOW FULL COLUMNS (an unquoted literal value).
    * @param string $nullable
-   * @param string $extra
+   * @param array $definition
+   *   The column's entry from getColumnDefinitions().
    *
    * @return string
    */
-  protected function buildDefaultClause($default, $nullable, $extra) {
+  protected function buildDefaultClause($default, $nullable, array $definition) {
+    if (!empty($definition['error'])) {
+      throw new CRM_Core_Exception($definition['error']);
+    }
     if ($default === NULL) {
       return ($nullable === 'YES') ? 'DEFAULT NULL' : '';
     }
-    // CURRENT_TIMESTAMP (with or without precision) and MySQL 8 expression
-    // defaults (Extra = DEFAULT_GENERATED) must not be quoted.
-    if (stripos($extra, 'DEFAULT_GENERATED') !== FALSE
-      || preg_match('/^current_timestamp(\(\d*\))?$/i', $default)
-    ) {
-      return "DEFAULT {$default}";
+    if (!empty($definition['default_is_expression'])) {
+      // MySQL 8 requires parentheses around expression defaults on string
+      // columns; MariaDB accepts them. MariaDB writes simple expressions
+      // unparenthesized, and its SHOW COLUMNS has them verbatim.
+      return 'DEFAULT (' . ($definition['default_expression'] ?? $default) . ')';
     }
-    $escaped = str_replace("'", "''", $default);
-    return "DEFAULT '{$escaped}'";
+    if (empty($definition['has_default'])) {
+      throw new CRM_Core_Exception(E::ts('Cannot identify a non-NULL column default. Conversion blocked.'));
+    }
+    return "DEFAULT '" . CRM_Core_DAO::escapeString($default) . "'";
   }
 
   /**
-   * Get generation expressions for generated columns of a table.
+   * Parse SHOW CREATE TABLE for each column's generation expression and how
+   * its default is written. information_schema and SHOW COLUMNS can't be used
+   * for expressions: MySQL 8 returns them with quotes and backslashes escaped
+   * a second time, which is not valid SQL.
    *
    * @param string $table
    *
    * @return array
-   *   Field name => generation expression.
+   *   Field name => [
+   *     'generated' => generation expression, or NULL,
+   *     'default_is_expression' => bool,
+   *     'default_expression' => default expression from inside its
+   *       parentheses, or NULL when it is written unparenthesized (MariaDB),
+   *   ].
    */
-  protected function getGenerationExpressions($table) {
-    $expressions = [];
-    $dao = CRM_Core_DAO::executeQuery("
-      SELECT COLUMN_NAME, GENERATION_EXPRESSION
-      FROM information_schema.COLUMNS
-      WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME = %1
-        AND GENERATION_EXPRESSION IS NOT NULL
-        AND GENERATION_EXPRESSION != ''
-    ", [1 => [$table, 'String']]);
-    while ($dao->fetch()) {
-      $expressions[$dao->COLUMN_NAME] = $dao->GENERATION_EXPRESSION;
+  protected function getColumnDefinitions($table, $createTable = NULL) {
+    $createTable = $createTable ?? $this->getCreateTable($table);
+    $definitions = [];
+    foreach (explode("\n", $createTable) as $line) {
+      // SHOW CREATE can use backticks, ANSI quotes, or unquoted identifiers.
+      if (!preg_match('/^\s+(?:`((?:[^`]|``)+)`|"((?:[^"]|"")+)"|([\p{L}\p{N}_$]+))\s+/u', $line, $m)) {
+        continue;
+      }
+      $field = ($m[1] ?? '') !== '' ? str_replace('``', '`', $m[1])
+        : (($m[2] ?? '') !== '' ? str_replace('""', '"', $m[2]) : $m[3]);
+      // Look for keywords and parentheses only outside quoted text.
+      $masked = self::maskQuoted($line);
+      $definition = [
+        'generated' => NULL,
+        'default_is_expression' => FALSE,
+        'default_expression' => NULL,
+        'has_default' => FALSE,
+      ];
+      if (preg_match('/\sAS\s*\(/i', $masked, $as, PREG_OFFSET_CAPTURE)) {
+        $definition['generated'] = self::parenthesized($line, $masked, $as[0][1] + strlen($as[0][0]) - 1);
+        if ($definition['generated'] === NULL) {
+          $definition['error'] = E::ts('Cannot parse the generation expression for %1.', [1 => $field]);
+        }
+      }
+      if (preg_match('/\sDEFAULT\s+/i', $masked, $match, PREG_OFFSET_CAPTURE)) {
+        $definition['has_default'] = TRUE;
+        $start = $match[0][1] + strlen($match[0][0]);
+        $next = $line[$start] ?? '';
+        if ($next === '(') {
+          $definition['default_is_expression'] = TRUE;
+          $definition['default_expression'] = self::parenthesized($line, $masked, $start);
+          if ($definition['default_expression'] === NULL) {
+            $definition['error'] = E::ts('Cannot parse the default expression for %1.', [1 => $field]);
+          }
+        }
+        elseif ($next !== "'" && !preg_match('/^NULL\b/i', substr($line, $start))) {
+          $definition['default_is_expression'] = TRUE;
+        }
+      }
+      $definitions[$field] = $definition;
     }
-    return $expressions;
+    return $definitions;
+  }
+
+  /** Read canonical DDL; never substitute an empty definition on failure. */
+  protected function getCreateTable($table) {
+    $quoted = str_replace('`', '``', $table);
+    $dao = CRM_Core_DAO::executeQuery("SHOW CREATE TABLE `{$quoted}`");
+    if (!$dao->fetch() || empty($dao->Create_Table)) {
+      throw new CRM_Core_Exception(E::ts('Cannot read the schema of %1.', [1 => $table]));
+    }
+    return (string) $dao->Create_Table;
+  }
+
+  public function getSchemaFingerprint($table) {
+    return self::fingerprint($this->getCreateTable($table));
+  }
+
+  /** Ignore the mutable sequence counter, but preserve all schema details. */
+  protected static function fingerprint($ddl) {
+    if (preg_match('/\bAUTO_INCREMENT\s*=\s*\d+/i', self::maskQuoted($ddl), $match, PREG_OFFSET_CAPTURE)) {
+      $ddl = substr_replace($ddl, 'AUTO_INCREMENT=0', $match[0][1], strlen($match[0][0]));
+    }
+    return hash('sha256', $ddl);
   }
 
   /**
-   * Get all InnoDB tables with their engine and collation.
+   * Replace quoted strings and identifiers in SQL with "x", keeping offsets,
+   * so keywords and parentheses can be found outside them.
+   *
+   * @param string $sql
+   *
+   * @return string
+   */
+  protected static function maskQuoted($sql) {
+    $masked = $sql;
+    $quote = NULL;
+    $length = strlen($sql);
+    for ($i = 0; $i < $length; $i++) {
+      $char = $sql[$i];
+      if ($quote === NULL) {
+        if ($char === "'" || $char === '"' || $char === '`') {
+          $quote = $char;
+          $masked[$i] = 'x';
+        }
+        continue;
+      }
+      $masked[$i] = 'x';
+      if ($char === '\\' && $quote !== '`' && $i + 1 < $length) {
+        $masked[++$i] = 'x';
+      }
+      elseif ($char === $quote) {
+        if (($sql[$i + 1] ?? '') === $quote) {
+          $masked[++$i] = 'x';
+        }
+        else {
+          $quote = NULL;
+        }
+      }
+    }
+    return $masked;
+  }
+
+  /**
+   * Text inside the parenthesis that opens at $open, up to its match.
+   *
+   * @param string $sql
+   * @param string $masked
+   *   $sql with quoted text masked out, see maskQuoted().
+   * @param int $open
+   *   Offset of the opening parenthesis.
+   *
+   * @return string|null
+   *   NULL when the parenthesis is never closed.
+   */
+  protected static function parenthesized($sql, $masked, $open) {
+    $depth = 0;
+    $length = strlen($masked);
+    for ($i = $open; $i < $length; $i++) {
+      if ($masked[$i] === '(') {
+        $depth++;
+      }
+      elseif ($masked[$i] === ')' && --$depth === 0) {
+        return substr($sql, $open + 1, $i - $open - 1);
+      }
+    }
+    return NULL;
+  }
+
+  /**
+   * Get all InnoDB tables with their engine, collation and row format.
    *
    * @return array
    */
@@ -385,6 +606,45 @@ class CRM_Collationfix_Analyzer {
       $tables[$dao->Name] = [
         'Engine' => $dao->Engine,
         'Collation' => $dao->Collation,
+        'Row_format' => $dao->Row_format,
+      ];
+    }
+    return $tables;
+  }
+
+  /**
+   * CiviCRM tables outside this tool's scope that still use utf8/utf8mb3:
+   * non-InnoDB civicrm_* tables, and detailed-logging log_civicrm_* tables.
+   *
+   * @return array
+   *   Table name => ['engine' => ..., 'collation' => ..., 'reason' => ...].
+   */
+  public function getUncoveredTables() {
+    $tables = [];
+    $dao = CRM_Core_DAO::executeQuery("
+      SELECT t.TABLE_NAME AS table_name, t.ENGINE AS engine, t.TABLE_COLLATION AS table_collation,
+        SUM(c.CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')) AS legacy_columns
+      FROM information_schema.TABLES t
+      LEFT JOIN information_schema.COLUMNS c
+        ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
+        AND c.TABLE_NAME = t.TABLE_NAME
+      WHERE t.TABLE_SCHEMA = DATABASE()
+        AND t.TABLE_TYPE = 'BASE TABLE'
+        AND (
+          (t.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%' AND t.ENGINE <> 'InnoDB')
+          OR t.TABLE_NAME LIKE 'log\_" . self::CIVICRM_TABLE_PREFIX . "%'
+        )
+      GROUP BY t.TABLE_NAME, t.ENGINE, t.TABLE_COLLATION
+      HAVING legacy_columns > 0 OR table_collation LIKE 'utf8\_%' OR table_collation LIKE 'utf8mb3\_%'
+      ORDER BY t.TABLE_NAME
+    ");
+    while ($dao->fetch()) {
+      $tables[$dao->table_name] = [
+        'engine' => $dao->engine,
+        'collation' => $dao->table_collation,
+        'reason' => (strpos($dao->table_name, 'log_') === 0)
+          ? E::ts('Detailed logging table. Logging triggers copy every change here, so 4-byte characters are still rejected until it is converted too.')
+          : E::ts('%1 engine; only InnoDB tables are converted.', [1 => $dao->engine]),
       ];
     }
     return $tables;
@@ -414,49 +674,158 @@ class CRM_Collationfix_Analyzer {
   }
 
   /**
-   * Flag indexed varchar columns longer than 191 chars, which can exceed
-   * the 767-byte index prefix limit on older row formats once 4-byte.
+   * Flag indexes whose key will exceed the InnoDB limit once their utf8
+   * columns take 4 bytes per character. The ALTER fails outright for these.
+   *
+   * Include every declared key part. Unknown/functional parts produce an
+   * explicit warning instead of being silently counted as zero bytes.
    *
    * @param array $result
    *   Analysis result, modified by reference.
    */
   protected function addIndexWarnings(&$result) {
     $dao = CRM_Core_DAO::executeQuery("
-      SELECT s.TABLE_NAME, s.COLUMN_NAME, s.INDEX_NAME, c.CHARACTER_MAXIMUM_LENGTH
+      SELECT s.TABLE_NAME AS table_name, s.INDEX_NAME AS index_name,
+        s.COLUMN_NAME AS column_name, s.SUB_PART AS sub_part,
+        c.DATA_TYPE AS data_type, c.COLUMN_TYPE AS column_type,
+        c.CHARACTER_SET_NAME AS charset, c.CHARACTER_MAXIMUM_LENGTH AS char_length,
+        c.CHARACTER_OCTET_LENGTH AS octet_length,
+        c.NUMERIC_PRECISION AS numeric_precision, c.NUMERIC_SCALE AS numeric_scale,
+        c.DATETIME_PRECISION AS datetime_precision
       FROM information_schema.STATISTICS s
-      INNER JOIN information_schema.COLUMNS c
+      LEFT JOIN information_schema.COLUMNS c
         ON c.TABLE_SCHEMA = s.TABLE_SCHEMA
         AND c.TABLE_NAME = s.TABLE_NAME
         AND c.COLUMN_NAME = s.COLUMN_NAME
       WHERE s.TABLE_SCHEMA = DATABASE()
         AND s.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
-        AND c.DATA_TYPE = 'varchar'
-        AND c.CHARACTER_MAXIMUM_LENGTH > 191
-        AND c.CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')
+        AND s.INDEX_TYPE = 'BTREE'
+      ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
     ");
+    $indexes = [];
     while ($dao->fetch()) {
-      if (isset($result[$dao->TABLE_NAME]) && $result[$dao->TABLE_NAME]['needs_change']) {
-        $result[$dao->TABLE_NAME]['warnings'][] = E::ts(
-          'Index %1 covers varchar(%2) column %3 - verify index length limits before converting (ROW_FORMAT=Dynamic usually resolves this).',
-          [1 => $dao->INDEX_NAME, 2 => $dao->CHARACTER_MAXIMUM_LENGTH, 3 => $dao->COLUMN_NAME]
-        );
+      if (empty($result[$dao->table_name]['needs_change'])) {
+        continue;
+      }
+      $indexes[$dao->table_name][$dao->index_name][] = (array) $dao;
+    }
+    foreach ($indexes as $table => $tableIndexes) {
+      foreach ($tableIndexes as $name => $parts) {
+        $bytes = 0;
+        $unknown = FALSE;
+        foreach ($parts as $part) {
+          $size = self::indexPartBytes($part);
+          $unknown = $unknown || $size === NULL;
+          $bytes += $size ?? 0;
+        }
+        $limit = $this->getIndexKeyLimit($result[$table]['row_format']);
+        if ($bytes > $limit) {
+          $result[$table]['warnings'][] = E::ts(
+            'Index %1 will need at least %2 bytes once converted, over the %3-byte InnoDB index key limit. Review its columns and prefix lengths before converting.',
+            [1 => $name, 2 => $bytes, 3 => $limit]
+          );
+        }
+        if ($unknown) {
+          $result[$table]['warnings'][] = E::ts('Index %1 contains a key part whose size cannot be determined. Verify its full key length manually before converting.', [1 => $name]);
+        }
       }
     }
   }
 
+  /** Maximum bytes in a declared index part, or NULL if unsupported. */
+  protected static function indexPartBytes(array $part) {
+    $type = strtolower((string) $part['data_type']);
+    if (in_array($type, ['char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext'], TRUE)) {
+      if (empty($part['char_length']) || empty($part['octet_length'])) {
+        return NULL;
+      }
+      $width = strpos((string) $part['charset'], 'utf8') === 0 ? 4 : $part['octet_length'] / $part['char_length'];
+      return (int) ceil(($part['sub_part'] ?? $part['char_length']) * $width);
+    }
+    if (in_array($type, ['binary', 'varbinary', 'tinyblob', 'blob', 'mediumblob', 'longblob'], TRUE)) {
+      return isset($part['sub_part']) || isset($part['octet_length']) ? (int) ($part['sub_part'] ?? $part['octet_length']) : NULL;
+    }
+    $fixed = ['tinyint' => 1, 'smallint' => 2, 'mediumint' => 3, 'int' => 4, 'integer' => 4, 'bigint' => 8, 'float' => 4, 'double' => 8, 'real' => 8, 'date' => 3, 'year' => 1];
+    if (isset($fixed[$type])) {
+      return $fixed[$type];
+    }
+    if ($type === 'bit') {
+      return isset($part['numeric_precision']) ? (int) ceil($part['numeric_precision'] / 8) : NULL;
+    }
+    if (in_array($type, ['decimal', 'numeric'], TRUE)) {
+      if (!isset($part['numeric_precision'], $part['numeric_scale'])) {
+        return NULL;
+      }
+      $digits = [0, 1, 1, 2, 2, 3, 3, 4, 4];
+      $integer = (int) $part['numeric_precision'] - (int) $part['numeric_scale'];
+      $fraction = (int) $part['numeric_scale'];
+      return intdiv($integer, 9) * 4 + $digits[$integer % 9] + intdiv($fraction, 9) * 4 + $digits[$fraction % 9];
+    }
+    $temporal = ['time' => 3, 'datetime' => 5, 'timestamp' => 4];
+    if (isset($temporal[$type])) {
+      return $temporal[$type] + (int) ceil(($part['datetime_precision'] ?? 0) / 2);
+    }
+    if (in_array($type, ['enum', 'set'], TRUE)) {
+      $masked = self::maskQuoted((string) $part['column_type']);
+      $members = substr_count($masked, ',') + 1;
+      if (strpos($masked, '(') === FALSE) {
+        return NULL;
+      }
+      if ($type === 'enum') {
+        return $members > 255 ? 2 : 1;
+      }
+      $bytes = (int) ceil($members / 8);
+      return $bytes > 4 ? 8 : $bytes;
+    }
+    return NULL;
+  }
+
   /**
-   * Quick count of tables not yet on utf8mb4 (used by the status check).
+   * Largest InnoDB index key, in bytes, for a row format on this server.
+   *
+   * @param string $rowFormat
+   *
+   * @return int
+   */
+  protected function getIndexKeyLimit($rowFormat) {
+    $details = $this->getServerDetails();
+    $largePrefix = in_array(strtolower($rowFormat), ['dynamic', 'compressed'], TRUE)
+      && !in_array(strtoupper($details['innodb_large_prefix'] ?? 'ON'), ['OFF', '0'], TRUE);
+    if (!$largePrefix) {
+      return 767;
+    }
+    // 3072 bytes on 16 KB and larger pages, scaled down on smaller ones.
+    $pageSize = (int) ($details['innodb_page_size'] ?? 16384);
+    return (int) min(3072, $pageSize * 3 / 16);
+  }
+
+  /**
+   * Quick count of tables with a utf8/utf8mb3 default or any utf8/utf8mb3
+   * column (used by the status check).
    *
    * @return int
    */
   public static function countNonUtf8mb4Tables() {
     return (int) CRM_Core_DAO::singleValueQuery("
-      SELECT COUNT(*)
-      FROM information_schema.TABLES
-      WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
-        AND ENGINE = 'InnoDB'
-        AND (TABLE_COLLATION LIKE 'utf8\_%' OR TABLE_COLLATION LIKE 'utf8mb3\_%')
+      SELECT COUNT(*) FROM (
+        SELECT TABLE_NAME
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
+          AND ENGINE = 'InnoDB'
+          AND (TABLE_COLLATION LIKE 'utf8\_%' OR TABLE_COLLATION LIKE 'utf8mb3\_%')
+        UNION
+        SELECT c.TABLE_NAME
+        FROM information_schema.COLUMNS c
+        INNER JOIN information_schema.TABLES t
+          ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+          AND t.TABLE_NAME = c.TABLE_NAME
+        WHERE c.TABLE_SCHEMA = DATABASE()
+          AND t.TABLE_SCHEMA = DATABASE()
+          AND c.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
+          AND t.ENGINE = 'InnoDB'
+          AND c.CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')
+      ) legacy
     ");
   }
 

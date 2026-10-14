@@ -1,0 +1,58 @@
+{* Collation Fix - help text for the server variables on the analysis page *}
+
+{htxt id="character_set_server"}
+  <p>{ts}The server-wide default character set. It is only used when a new database is created without naming a character set. It does not change existing databases or tables.{/ts}</p>
+  <p>{ts}utf8mb4 is recommended, so that databases created later default to 4-byte UTF-8. It is set in the MySQL/MariaDB configuration (character-set-server), not by this tool.{/ts}</p>
+{/htxt}
+
+{htxt id="collation_server"}
+  <p>{ts}The server-wide default collation, used with character_set_server when a new database is created without naming one. It does not change existing databases or tables.{/ts}</p>
+  <p>{ts}It is set in the MySQL/MariaDB configuration (collation-server), not by this tool. Using the same collation as this tool's target collation keeps new databases consistent with the converted tables.{/ts}</p>
+{/htxt}
+
+{htxt id="character_set_database"}
+  <p>{ts}The default character set of the CiviCRM database. Tables created without naming a character set inherit it, for example tables from an extension whose install SQL does not name one, or tables created by hand.{/ts}</p>
+  <p>{ts}CiviCRM creates custom field and temporary tables with the collation of civicrm_contact, so those follow the converted tables whatever this says. This tool does not change the database default. If it is still utf8 or utf8mb3, a database administrator can change it with the statement below. That only affects tables created afterwards; it does not convert existing ones.{/ts}</p>
+  <pre>ALTER DATABASE `{$params.database|escape}` CHARACTER SET utf8mb4 COLLATE {$params.collation|escape};</pre>
+{/htxt}
+
+{htxt id="collation_database"}
+  <p>{ts}The default collation of the CiviCRM database, inherited by tables created without naming a collation (see character_set_database).{/ts}</p>
+  <p>{ts}Ideally it matches the target collation of the converted tables. This tool does not change it. A database administrator can change it with the statement below, which only affects tables created afterwards.{/ts}</p>
+  <pre>ALTER DATABASE `{$params.database|escape}` CHARACTER SET utf8mb4 COLLATE {$params.collation|escape};</pre>
+{/htxt}
+
+{htxt id="character_set_connection"}
+  <p>{ts}The character set the server assumes for text sent over the current connection, such as values in queries.{/ts}</p>
+  <p>{ts}CiviCRM runs SET NAMES utf8mb4 on every connection, so this normally reads utf8mb4 even before any tables are converted. Emoji and other 4-byte characters therefore reach the server intact, and it is the columns still on utf8 that cannot store them: saving one fails with an "Incorrect string value" error or turns the character into a question mark.{/ts}</p>
+{/htxt}
+
+{htxt id="collation_connection"}
+  <p>{ts}The collation of text values sent over the current connection. After SET NAMES utf8mb4 it is the server's default utf8mb4 collation, for example utf8mb4_0900_ai_ci on MySQL 8 or utf8mb4_general_ci on MariaDB.{/ts}</p>
+  <p>{ts}When a value is compared with a column, the column's collation normally wins, so a difference here is usually harmless. It can cause "Illegal mix of collations" errors in queries that use SQL variables or stored functions. The same error occurs when two columns with the same character set but different collations are compared, such as a utf8mb4_unicode_ci table joined to a utf8mb4_0900_ai_ci one; converting every table to the same target collation avoids that.{/ts}</p>
+{/htxt}
+
+{htxt id="innodb_file_per_table"}
+  <p>{ts}Whether each InnoDB table is stored in its own file (ON) or in the shared system tablespace, ibdata1 (OFF).{/ts}</p>
+  <p>{ts}Converting a table rebuilds it, which needs free disk space of roughly the table's size while the ALTER runs. With ON, the old copy's space is returned to the operating system afterwards. With OFF, the shared tablespace grows during the rebuild and never shrinks. ON is the default and is recommended.{/ts}</p>
+{/htxt}
+
+{htxt id="innodb_large_prefix"}
+  <p>{ts}Only present on older servers (MySQL 5.6 and 5.7, MariaDB 10.2 and earlier). When ON, InnoDB tables using the DYNAMIC or COMPRESSED row format can have index keys of up to 3072 bytes; otherwise the limit is 767 bytes. Newer servers removed the setting and always allow the larger limit.{/ts}</p>
+  <p>{ts}utf8mb4 needs up to 4 bytes per character, so an index on a VARCHAR(255) column grows to 1020 bytes and cannot be converted under the 767-byte limit. The analysis warns about indexes that would exceed the limit.{/ts}</p>
+{/htxt}
+
+{htxt id="innodb_default_row_format"}
+  <p>{ts}The row format given to new InnoDB tables that do not name one. DYNAMIC, the default on current servers, allows index keys of up to 3072 bytes; COMPACT and REDUNDANT are limited to 767 bytes.{/ts}</p>
+  <p>{ts}When this tool converts a table's default character set it also sets ROW_FORMAT=DYNAMIC, so the conversion does not depend on this setting. Tables using COMPRESSED keep that format.{/ts}</p>
+{/htxt}
+
+{htxt id="innodb_page_size"}
+  <p>{ts}The size of an InnoDB page in bytes, fixed when the server's data directory was first created. The default is 16384 (16 KB).{/ts}</p>
+  <p>{ts}It caps the index key length: 3072 bytes with 16 KB or larger pages, 1536 bytes with 8 KB pages and 768 bytes with 4 KB pages. The analysis uses it when warning about indexes that would be too long after conversion.{/ts}</p>
+{/htxt}
+
+{htxt id="max_allowed_packet"}
+  <p>{ts}The largest single query, or single row sent to or from the server, in bytes.{/ts}</p>
+  <p>{ts}It does not limit the conversion: the ALTER statements are small, and existing text keeps the same bytes, because every character stored in utf8 has the same encoding in utf8mb4. It is shown to help troubleshoot imports or large values that fail with a "packet too large" error.{/ts}</p>
+{/htxt}

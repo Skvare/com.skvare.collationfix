@@ -9,12 +9,20 @@ class CRM_Collationfix_Page_Download extends CRM_Core_Page {
 
   public function run() {
     $analyzer = new CRM_Collationfix_Analyzer();
-    $analysis = $analyzer->analyze();
+    // The analysis page posts the selected tables; without them, every table
+    // that needs a change is exported.
+    $tables = NULL;
+    if (!empty($_POST['tables']) && is_array($_POST['tables'])) {
+      $tables = array_map('strval', $_POST['tables']);
+    }
+    $analysis = $analyzer->analyze($tables);
 
     $lines = [
       '-- Collation Fix (com.skvare.collationfix)',
       '-- Database: ' . $analyzer->getDatabaseName(),
       '-- Server: ' . $analyzer->getServerVersion(),
+      '-- Target collation: ' . $analyzer->getTargetCollation(),
+      '-- Tables: ' . ($tables === NULL ? 'all that need a change' : 'selected on the analysis page'),
       '-- Generated: ' . date('Y-m-d H:i:s'),
       '-- Review before running. Take a backup first.',
       '',
@@ -25,6 +33,13 @@ class CRM_Collationfix_Page_Download extends CRM_Core_Page {
         continue;
       }
       $lines[] = '-- ===== TABLE ' . $table . ' (' . $item['size_formatted'] . ') =====';
+      if ($item['blocked']) {
+        foreach ($item['errors'] as $error) {
+          $lines[] = '-- BLOCKED: ' . str_replace(["\r", "\n"], ' ', $error);
+        }
+        $lines[] = '';
+        continue;
+      }
       foreach ($item['warnings'] as $warning) {
         $lines[] = '-- WARNING: ' . str_replace("\n", ' ', $warning);
       }

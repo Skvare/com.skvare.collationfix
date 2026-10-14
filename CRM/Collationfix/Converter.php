@@ -15,10 +15,29 @@ class CRM_Collationfix_Converter {
    *
    * @param array $tables
    *   Table names to convert.
+   * @param string|null $targetCollation
+   *   The confirmed target collation. Every task converts to it, even if the
+   *   setting changes while the queue runs.
+   * @param array|null $reviewed
+   *   Saved analysis from the confirmation screen, keyed by table. When
+   *   omitted by a programmatic caller, capture a plan at queue creation.
    *
    * @return CRM_Queue_Queue
    */
-  public static function buildQueue(array $tables) {
+  public static function buildQueue(array $tables, $targetCollation = NULL, ?array $reviewed = NULL) {
+    $analyzer = new CRM_Collationfix_Analyzer($targetCollation);
+    $targetCollation = $analyzer->getTargetCollation();
+    $plans = [];
+    // Validate all tables before creating a queue. Never replace the plan
+    // saved by the confirmation form with a freshly generated approval.
+    foreach ($tables as $table) {
+      $item = $analyzer->analyzeTable($table);
+      self::assertConvertible($item);
+      if ($reviewed !== NULL) {
+        self::assertPlanMatches($item, $reviewed[$table] ?? []);
+      }
+      $plans[$table] = ['schema_fingerprint' => $item['schema_fingerprint'], 'alter' => $item['alter']];
+    }
     // Unique per run so two conversions started around the same time (two
     // admins, two tabs, a double-submit) can never reset/clobber each
     // other's queue - a fixed queue name would let the second call wipe out
@@ -31,7 +50,7 @@ class CRM_Collationfix_Converter {
     foreach ($tables as $table) {
       $queue->createItem(new CRM_Queue_Task(
         ['CRM_Collationfix_Converter', 'convertTableTask'],
-        [$table],
+        [$table, $targetCollation, $plans[$table]],
         E::ts('Converting %1', [1 => $table])
       ));
     }
@@ -41,16 +60,19 @@ class CRM_Collationfix_Converter {
   /**
    * Queue task callback: convert a single table.
    *
-   * The ALTER is regenerated at run time so it always reflects the current
-   * schema, even if the analysis page was loaded a while ago.
+   * Execute only while the schema and ALTER still match the reviewed plan.
+   * Old tasks without a saved plan fail safely and require a fresh review.
    *
    * @param CRM_Queue_TaskContext $ctx
    * @param string $table
+   * @param string|null $targetCollation
+   * @param array|null $plan
+   *   Reviewed schema fingerprint and ALTER statement.
    *
    * @return bool
    */
-  public static function convertTableTask(CRM_Queue_TaskContext $ctx, $table) {
-    self::convertTable($table);
+  public static function convertTableTask(CRM_Queue_TaskContext $ctx, $table, $targetCollation = NULL, ?array $plan = NULL) {
+    self::convertTable($table, $targetCollation, $plan ?? []);
     // Always continue the queue; failures are recorded in the log.
     return TRUE;
   }
@@ -59,12 +81,17 @@ class CRM_Collationfix_Converter {
    * Convert one table, timing the ALTER and recording the outcome.
    *
    * @param string $table
+   * @param string|null $targetCollation
+   *   Defaults to the target collation setting.
+   * @param array|null $plan
+   *   Optional reviewed plan. Direct CLI conversion analyzes immediately;
+   *   queued conversion must provide its saved plan.
    *
    * @return array
    *   The log record that was written.
    */
-  public static function convertTable($table) {
-    $analyzer = new CRM_Collationfix_Analyzer();
+  public static function convertTable($table, $targetCollation = NULL, ?array $plan = NULL) {
+    $analyzer = NULL;
     $log = [
       'table_name' => $table,
       'statement' => '',
@@ -74,10 +101,16 @@ class CRM_Collationfix_Converter {
       'status' => 'skipped',
       'error_message' => '',
     ];
+    $logId = NULL;
 
     try {
+      $analyzer = new CRM_Collationfix_Analyzer($targetCollation);
       $item = $analyzer->analyzeTable($table);
       $log['collation_before'] = $item['current_collation'];
+      self::assertConvertible($item);
+      if ($plan !== NULL) {
+        self::assertPlanMatches($item, $plan);
+      }
 
       if (!$item['needs_change']) {
         $log['status'] = 'skipped';
@@ -85,6 +118,13 @@ class CRM_Collationfix_Converter {
       }
       else {
         $log['statement'] = $item['alter'];
+        // Record the attempt first, so a request killed mid-ALTER leaves a
+        // 'running' row rather than no trace at all.
+        $log['status'] = 'running';
+        $logId = self::writeLog($log);
+        if ($analyzer->getSchemaFingerprint($table) !== $item['schema_fingerprint']) {
+          throw new CRM_Core_Exception(E::ts('The schema of %1 changed before execution. Review it again before converting.', [1 => $table]));
+        }
         $start = microtime(TRUE);
         CRM_Core_DAO::executeQuery($item['alter'], [], TRUE, NULL, FALSE, FALSE);
         $log['duration_ms'] = (int) round((microtime(TRUE) - $start) * 1000);
@@ -100,6 +140,9 @@ class CRM_Collationfix_Converter {
     // collations are checked as well as the table default. A successful ALTER
     // that still leaves columns (or the default) off target is an error.
     try {
+      if ($analyzer === NULL) {
+        throw new CRM_Core_Exception('Analysis was not initialized.');
+      }
       $after = $analyzer->analyzeTable($table);
       $log['collation_after'] = $after['current_collation'];
       $remaining = [];
@@ -109,29 +152,54 @@ class CRM_Collationfix_Converter {
       foreach ($after['skipped_columns'] as $col) {
         $remaining[] = "{$col['field']} ({$col['reason']})";
       }
-      if ($log['status'] === 'success' && ($remaining || $after['needs_change'])) {
+      if (in_array($log['status'], ['success', 'skipped'], TRUE) && ($remaining || $after['needs_change'] || $after['blocked'])) {
         $log['status'] = 'error';
-        $log['error_message'] = E::ts('The ALTER ran, but verification found the table is not fully converted. Table collation: %1. Unconverted columns: %2', [
+        $log['error_message'] = E::ts('Verification found the table is not fully converted. Table collation: %1. Unconverted columns: %2', [
           1 => $after['current_collation'],
           2 => $remaining ? implode(', ', $remaining) : E::ts('none'),
         ]);
       }
     }
     catch (Exception $e) {
-      // Non-fatal.
+      // An unverified ALTER must not be reported as a success.
+      if (in_array($log['status'], ['success', 'skipped'], TRUE)) {
+        $log['status'] = 'error';
+        $log['error_message'] = E::ts('The conversion result could not be verified: %1', [1 => $e->getMessage()]);
+      }
     }
 
-    self::writeLog($log);
+    self::writeLog($log, $logId);
     return $log;
   }
 
+  protected static function assertConvertible(array $item) {
+    if (!empty($item['blocked']) || !empty($item['skipped_columns'])) {
+      throw new CRM_Core_Exception(E::ts('Conversion of %1 is blocked: %2', [
+        1 => $item['table'],
+        2 => implode(' ', $item['errors']),
+      ]));
+    }
+  }
+
+  protected static function assertPlanMatches(array $item, array $plan) {
+    if (empty($plan['schema_fingerprint'])
+      || $item['schema_fingerprint'] !== $plan['schema_fingerprint']
+      || !isset($plan['alter']) || $item['alter'] !== $plan['alter']) {
+      throw new CRM_Core_Exception(E::ts('The schema or conversion plan for %1 changed. Return to the analysis page and review it again.', [1 => $item['table']]));
+    }
+  }
+
   /**
-   * Insert a record into civicrm_collationfix_log.
+   * Insert a record into civicrm_collationfix_log, or update it when $id is
+   * given.
    *
    * @param array $log
+   * @param int|null $id
+   *
+   * @return int
+   *   The record ID.
    */
-  public static function writeLog(array $log) {
-    $contactId = CRM_Core_Session::getLoggedInContactID();
+  public static function writeLog(array $log, $id = NULL) {
     $params = [
       1 => [$log['table_name'], 'String'],
       2 => [(string) $log['statement'], 'String'],
@@ -141,6 +209,17 @@ class CRM_Collationfix_Converter {
       6 => [$log['status'], 'String'],
       7 => [(string) $log['error_message'], 'String'],
     ];
+    if ($id) {
+      $params[8] = [(int) $id, 'Integer'];
+      CRM_Core_DAO::executeQuery("
+        UPDATE civicrm_collationfix_log
+        SET table_name = %1, statement = %2, collation_before = %3, collation_after = %4,
+          duration_ms = %5, status = %6, error_message = %7
+        WHERE id = %8
+      ", $params);
+      return (int) $id;
+    }
+    $contactId = CRM_Core_Session::getLoggedInContactID();
     // created_id is a nullable FK; CRM_Utils_Type won't bind NULL through an
     // 'Integer' placeholder, so fall back to a literal NULL when there is no
     // logged-in contact (e.g. run from cv/cron) rather than storing a bogus 0.
@@ -153,6 +232,7 @@ class CRM_Collationfix_Converter {
         (table_name, statement, collation_before, collation_after, duration_ms, status, error_message, created_id, created_date)
       VALUES (%1, %2, %3, %4, %5, %6, %7, {$createdId}, NOW())
     ", $params);
+    return (int) CRM_Core_DAO::singleValueQuery('SELECT LAST_INSERT_ID()');
   }
 
 }

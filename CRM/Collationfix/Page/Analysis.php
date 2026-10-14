@@ -29,6 +29,7 @@ class CRM_Collationfix_Page_Analysis extends CRM_Core_Page {
     $this->assign('serverVersion', $analyzer->getServerVersion());
     $this->assign('isMariaDb', $analyzer->isMariaDb());
     $this->assign('serverDetails', $analyzer->getServerDetails());
+    $this->assign('uncoveredTables', $analyzer->getUncoveredTables());
     $this->assign('targetCollation', $analyzer->getTargetCollation());
     $this->assign('settingsUrl', CRM_Utils_System::url('civicrm/admin/setting/collationfix', 'reset=1'));
     $this->assign('totalTables', count($analysis));

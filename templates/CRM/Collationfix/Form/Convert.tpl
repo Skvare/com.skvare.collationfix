@@ -5,9 +5,11 @@
     <p><strong>{ts}You are about to run ALTER TABLE statements against the live database.{/ts}</strong></p>
     <ul>
       <li>{ts 1=$tableCount 2=$totalSize}%1 tables selected, approximately %2 of data and indexes will be rebuilt.{/ts}</li>
+      <li>{ts 1=$targetCollation|escape}Tables convert to <code>%1</code> (binary columns to <code>utf8mb4_bin</code>), even if the target collation setting changes while the run is in progress.{/ts}</li>
       <li>{ts}Each table is locked while its ALTER runs. Large tables can take several minutes.{/ts}</li>
       <li>{ts}Take a database backup before continuing. On replicated setups, expect replication lag.{/ts}</li>
       <li>{ts}Each statement, its duration, and its outcome will be recorded in the conversion log.{/ts}</li>
+      <li>{ts}If a selected table's schema changes after this review, its conversion is stopped and a new review is required.{/ts}</li>
     </ul>
   </div>
 
@@ -30,6 +32,11 @@
           <td>{$item.columns|@count}</td>
           <td>{$item.size_formatted|escape}</td>
         </tr>
+        {if $item.alter}
+          <tr>
+            <td colspan="5"><details><summary>{ts}Review SQL{/ts}</summary><pre style="white-space:pre-wrap;">{$item.alter|escape}</pre></details></td>
+          </tr>
+        {/if}
       {/foreach}
     </tbody>
   </table>

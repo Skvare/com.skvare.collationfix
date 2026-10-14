@@ -10,8 +10,7 @@ use CRM_Collationfix_ExtensionUtil as E;
 function _civicrm_api3_collationfix_convert_spec(&$spec) {
   $spec['tables'] = [
     'title' => E::ts('Tables'),
-    'description' => E::ts('One or more civicrm_* InnoDB tables, as an array or a comma-separated string.'),
-    'api.required' => 1,
+    'description' => E::ts('One or more civicrm_* InnoDB tables, as an array or a comma-separated string. Required unless dry_run is set; a dry run without tables analyzes every table.'),
   ];
   $spec['dry_run'] = [
     'title' => E::ts('Dry run'),
@@ -38,12 +37,12 @@ function _civicrm_api3_collationfix_convert_spec(&$spec) {
  * @throws CRM_Core_Exception
  */
 function civicrm_api3_collationfix_convert($params) {
-  $tables = $params['tables'];
+  $tables = $params['tables'] ?? [];
   if (!is_array($tables)) {
     $tables = explode(',', (string) $tables);
   }
   $tables = array_values(array_unique(array_filter(array_map('trim', $tables), 'strlen')));
-  if (!$tables) {
+  if (!$tables && empty($params['dry_run'])) {
     throw new CRM_Core_Exception(E::ts('No tables given.'));
   }
 
@@ -57,10 +56,13 @@ function civicrm_api3_collationfix_convert($params) {
 
   $values = [];
   if (!empty($params['dry_run'])) {
-    foreach ($analyzer->analyze($tables) as $table => $item) {
+    foreach ($analyzer->analyze($tables ?: NULL) as $table => $item) {
       $values[$table] = [
         'table_name' => $table,
         'needs_change' => $item['needs_change'],
+        'blocked' => $item['blocked'],
+        'errors' => $item['errors'],
+        'schema_fingerprint' => $item['schema_fingerprint'],
         'collation_before' => $item['current_collation'],
         'target_collation' => $item['target_collation'],
         'columns' => count($item['columns']),
@@ -73,10 +75,11 @@ function civicrm_api3_collationfix_convert($params) {
   }
 
   // Like the UI queue, carry on past a failed table; report failures at the
-  // end so CLI callers get a non-zero exit.
+  // end so CLI callers get a non-zero exit. Every table converts to the
+  // target collation read at the start of the call.
   $failed = [];
   foreach ($tables as $table) {
-    $values[$table] = CRM_Collationfix_Converter::convertTable($table);
+    $values[$table] = CRM_Collationfix_Converter::convertTable($table, $analyzer->getTargetCollation());
     if ($values[$table]['status'] === 'error') {
       $failed[] = $table;
     }
