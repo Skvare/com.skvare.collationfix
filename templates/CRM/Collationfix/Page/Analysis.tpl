@@ -16,24 +16,57 @@
         <strong>{ts}disabled{/ts}</strong> &nbsp;|&nbsp; {ts}Log tables are not listed or converted while logging is disabled.{/ts}
       {/if}
     </p>
-    {if $serverDetails}
-      <table class="report-layout collationfix-server-details" style="width:auto; margin:0.5em 0;">
+    <div class="collationfix-overview" style="display:flex; flex-wrap:wrap; align-items:flex-start; gap:0 1.5em;">
+      {if $serverDetails}
+        <table class="report-layout collationfix-server-details" style="width:auto; margin:0.5em 0;">
+          <thead>
+            <tr>
+              <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
+              <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {foreach from=$serverDetails key=name item=value name=sd}
+              {if $smarty.foreach.sd.iteration % 2 == 1}<tr>{/if}
+                <td><code>{$name|escape}</code> {help id=$name file="CRM/Collationfix/Page/Analysis" title=$name database=$databaseName collation=$targetCollation}</td>
+                <td>{$value|escape}</td>
+              {if $smarty.foreach.sd.iteration % 2 == 0}</tr>{elseif $smarty.foreach.sd.last}<td></td><td></td></tr>{/if}
+            {/foreach}
+          </tbody>
+        </table>
+      {/if}
+
+      {* Legend for the Status column. Keep the badges identical to the ones in the table below. *}
+      <table class="report-layout collationfix-legend" style="width:auto; max-width:32em; margin:0.5em 0;">
         <thead>
-          <tr>
-            <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
-            <th>{ts}Server variable{/ts}</th><th>{ts}Value{/ts}</th>
-          </tr>
+          <tr><th>{ts}Status{/ts}</th><th>{ts}What it means{/ts}</th></tr>
         </thead>
         <tbody>
-          {foreach from=$serverDetails key=name item=value name=sd}
-            {if $smarty.foreach.sd.iteration % 2 == 1}<tr>{/if}
-              <td><code>{$name|escape}</code> {help id=$name file="CRM/Collationfix/Page/Analysis" title=$name database=$databaseName collation=$targetCollation}</td>
-              <td>{$value|escape}</td>
-            {if $smarty.foreach.sd.iteration % 2 == 0}</tr>{elseif $smarty.foreach.sd.last}<td></td><td></td></tr>{/if}
-          {/foreach}
+          <tr>
+            <td><span class="crm-tag-item" style="background:#fdd;">{ts}Blocked{/ts}</span></td>
+            <td>{ts}Cannot be converted safely, so no SQL is generated and it cannot be selected. Open Details for the reason.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item" style="background:#fdd;">{ts}Warning{/ts}</span></td>
+            <td>{ts}Will be converted when selected, but read the warnings under Details first, such as an index that becomes too long, a large table, or a log table to convert with it.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item" style="background:#ffd;">{ts}Needs change{/ts}</span></td>
+            <td>{ts}Will be converted when selected. Nothing to flag.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item" style="background:#dfe;">{ts}OK{/ts}</span></td>
+            <td>{ts}Already on the target collation; nothing to do. Hidden unless you untick "Hide tables that are already utf8mb4".{/ts}</td>
+          </tr>
+          {if $loggingEnabled}
+            <tr>
+              <td><span class="crm-tag-item">{ts}Log{/ts}</span></td>
+              <td>{ts}A detailed-logging table. It is converted before the table it logs.{/ts}</td>
+            </tr>
+          {/if}
         </tbody>
       </table>
-    {/if}
+    </div>
     <p>{ts}Dry run by default: nothing on this page modifies the database. Statements are only executed from the conversion screen after explicit confirmation.{/ts}</p>
   </div>
 

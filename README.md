@@ -185,6 +185,11 @@ lag on replicated setups.
   `sessions`, etc.) are not listed or converted. Neither are extension
   tables that use another prefix (e.g. CiviRules' `civirule_*`). Convert
   those separately if needed.
+* Views are never listed or altered, including the `civicrm_<table>_<locale>`
+  views (e.g. `civicrm_option_value_fr_FR`) that multilingual CiviCRM
+  creates. A view's columns take their character set from its base table, so
+  converting `civicrm_option_value` converts what its locale views return;
+  they need no rebuild.
 * Only analyzes `civicrm_*` tables using the `InnoDB` engine, and log tables
   using `InnoDB` or `ARCHIVE`; tables on other engines (e.g. `MyISAM`/`Aria`)
   are not converted, even if they are still on a legacy utf8 collation. They

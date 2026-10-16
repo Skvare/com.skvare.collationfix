@@ -829,6 +829,9 @@ class CRM_Collationfix_Analyzer {
    */
   public function getTables() {
     $tables = [];
+    // The engine filter also leaves out views, which have none, such as the
+    // civicrm_<table>_<locale> views multilingual CiviCRM creates. A view's
+    // columns follow its base table, so converting the table converts them.
     $dao = CRM_Core_DAO::executeQuery("SHOW TABLE STATUS WHERE Name LIKE '" . self::CIVICRM_TABLE_PREFIX . "%' AND Engine = 'InnoDB'");
     while ($dao->fetch()) {
       $tables[$dao->Name] = self::tableMeta($dao, $this->database, FALSE);
