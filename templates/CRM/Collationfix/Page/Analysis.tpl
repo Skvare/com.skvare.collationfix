@@ -60,7 +60,7 @@
 
   <form method="post" action="{$convertUrl}" id="collationfix-form">
     <input type="hidden" name="qfKey" value="{$convertQfKey}"/>
-    <table class="display crm-sortable" id="collationfix-table">
+    <table class="display" id="collationfix-table">
       <thead>
         <tr>
           <th><input type="checkbox" id="collationfix-select-all" title="{ts}Select all{/ts}"/></th>
