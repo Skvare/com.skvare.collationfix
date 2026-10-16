@@ -19,9 +19,11 @@ class CRM_Collationfix_Page_Analysis extends CRM_Core_Page {
     });
     $totalColumns = 0;
     $totalBytes = 0;
+    $logTablesNeedingChange = 0;
     foreach ($needsChange as $item) {
       $totalColumns += count($item['columns']);
       $totalBytes += $item['size_bytes'];
+      $logTablesNeedingChange += (int) $item['is_log'];
     }
 
     $this->assign('analysis', $analysis);
@@ -30,6 +32,11 @@ class CRM_Collationfix_Page_Analysis extends CRM_Core_Page {
     $this->assign('isMariaDb', $analyzer->isMariaDb());
     $this->assign('serverDetails', $analyzer->getServerDetails());
     $this->assign('uncoveredTables', $analyzer->getUncoveredTables());
+    $this->assign('loggingEnabled', $analyzer->isLoggingEnabled());
+    $this->assign('loggingDatabaseName', $analyzer->getLoggingDatabaseName());
+    $this->assign('separateLoggingDatabase', $analyzer->hasSeparateLoggingDatabase());
+    $this->assign('loggingErrors', $analyzer->getLoggingErrors());
+    $this->assign('logTablesNeedingChange', $logTablesNeedingChange);
     $this->assign('targetCollation', $analyzer->getTargetCollation());
     $this->assign('settingsUrl', CRM_Utils_System::url('civicrm/admin/setting/collationfix', 'reset=1'));
     $this->assign('totalTables', count($analysis));

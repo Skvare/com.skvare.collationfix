@@ -45,6 +45,8 @@ class CRM_Collationfix_Form_Convert extends CRM_Core_Form {
       if (array_diff($this->_tables, array_keys($analyzer->getTables()))) {
         throw new CRM_Core_Exception(E::ts('A selected table is missing or unsupported. Return to the analysis page and review the selection again.'));
       }
+      // List the tables in the order the queue converts them.
+      $this->_tables = $analyzer->orderForConversion($this->_tables);
     }
 
     if (empty($this->_tables)) {
@@ -67,20 +69,30 @@ class CRM_Collationfix_Form_Convert extends CRM_Core_Form {
     }
 
     $totalBytes = 0;
+    $hasLogTables = FALSE;
     foreach ($analysis as $item) {
       if ($item['blocked']) {
         throw new CRM_Core_Exception(E::ts('Conversion of %1 is blocked: %2', [1 => $item['table'], 2 => implode(' ', $item['errors'])]));
       }
       $totalBytes += $item['size_bytes'];
+      $hasLogTables = $hasLogTables || $item['is_log'];
     }
 
     $this->assign('tables', $analysis);
     $this->assign('tableCount', count($this->_tables));
     $this->assign('totalSize', CRM_Collationfix_Analyzer::formatBytes($totalBytes));
     $this->assign('databaseName', $analyzer->getDatabaseName());
+    $this->assign('loggingDatabaseName', $analyzer->getLoggingDatabaseName());
     $this->assign('targetCollation', $this->_targetCollation);
+    $this->assign('hasLogTables', $hasLogTables);
+    $this->assign('unselectedLogTables', $analyzer->findUnselectedLogTables($analysis));
+    $confirmLogging = $this->requiresLoggingConfirmation();
+    $this->assign('confirmLoggingDatabase', $confirmLogging);
 
     $this->add('text', 'confirm_database', E::ts('Type the database name to confirm'), ['class' => 'huge'], TRUE);
+    if ($confirmLogging) {
+      $this->add('text', 'confirm_logging_database', E::ts('Type the logging database name to confirm'), ['class' => 'huge'], TRUE);
+    }
 
     $this->addButtons([
       [
@@ -96,18 +108,43 @@ class CRM_Collationfix_Form_Convert extends CRM_Core_Form {
   }
 
   public function addRules() {
-    $this->addFormRule(['CRM_Collationfix_Form_Convert', 'validateConfirmation']);
+    $this->addFormRule(['CRM_Collationfix_Form_Convert', 'validateConfirmation'], $this);
+  }
+
+  /**
+   * Whether the selection alters tables in a separate logging database,
+   * whose name must then be confirmed too.
+   *
+   * @return bool
+   */
+  public function requiresLoggingConfirmation() {
+    $analyzer = new CRM_Collationfix_Analyzer($this->_targetCollation);
+    if (!$analyzer->hasSeparateLoggingDatabase()) {
+      return FALSE;
+    }
+    foreach ($this->_tables as $table) {
+      if ($analyzer->isLogTable($table)) {
+        return TRUE;
+      }
+    }
+    return FALSE;
   }
 
   /**
    * @param array $values
+   * @param array $files
+   * @param CRM_Collationfix_Form_Convert|null $form
    * @return array|bool
    */
-  public static function validateConfirmation($values) {
+  public static function validateConfirmation($values, $files = [], $form = NULL) {
     $errors = [];
     $analyzer = new CRM_Collationfix_Analyzer();
     if (trim($values['confirm_database'] ?? '') !== $analyzer->getDatabaseName()) {
       $errors['confirm_database'] = E::ts('The database name does not match. Conversion not started.');
+    }
+    if ($form && $form->requiresLoggingConfirmation()
+      && trim($values['confirm_logging_database'] ?? '') !== $analyzer->getLoggingDatabaseName()) {
+      $errors['confirm_logging_database'] = E::ts('The logging database name does not match. Conversion not started.');
     }
     return empty($errors) ? TRUE : $errors;
   }

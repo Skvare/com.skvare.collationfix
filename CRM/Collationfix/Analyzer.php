@@ -20,7 +20,14 @@ class CRM_Collationfix_Analyzer {
   const DEFAULT_COLLATION = 'utf8mb4_unicode_ci';
   const NEW_BINARY_COLLATION = 'utf8mb4_bin';
   const CIVICRM_TABLE_PREFIX = 'civicrm\\_';
+  const LOG_TABLE_PREFIX = 'log\\_';
   const TARGET_COLLATION_SETTING = 'collationfix_target_collation';
+
+  /**
+   * Engines of detailed-logging tables that are converted. ARCHIVE was the
+   * default for log tables before InnoDB.
+   */
+  const LOG_TABLE_ENGINES = ['InnoDB', 'ARCHIVE'];
 
   /**
    * Table size (in bytes) above which a "large table" warning is raised.
@@ -48,6 +55,25 @@ class CRM_Collationfix_Analyzer {
    * @var array|null
    */
   protected $serverDetails;
+
+  /**
+   * @var string|null
+   */
+  protected $loggingDatabase;
+
+  /**
+   * Log table name => TRUE.
+   *
+   * @var array|null
+   */
+  protected $logTableNames;
+
+  /**
+   * Problems reading the logging database, keyed to avoid repeats.
+   *
+   * @var array
+   */
+  protected $loggingErrors = [];
 
   /**
    * @param string|null $targetCollation
@@ -187,14 +213,152 @@ class CRM_Collationfix_Analyzer {
   }
 
   /**
-   * Analyze all InnoDB tables in the CiviCRM database.
+   * Whether CiviCRM detailed logging is enabled. Log tables are converted
+   * only then, because only then do logging triggers write to them.
    *
-   * @param array|null $onlyTables
-   *   Optional list of table names to restrict analysis to.
+   * @return bool
+   */
+  public function isLoggingEnabled() {
+    return (bool) Civi::settings()->get('logging');
+  }
+
+  /**
+   * Name of the database holding the detailed-logging tables, resolved like
+   * CRM_Logging_Schema does: from CIVICRM_LOGGING_DSN when defined, otherwise
+   * the CiviCRM database. Core reaches it through the CiviCRM connection
+   * (its triggers write to `database`.log_*), and so does this tool.
+   *
+   * @return string
+   */
+  public function getLoggingDatabaseName() {
+    if ($this->loggingDatabase === NULL) {
+      $this->loggingDatabase = $this->database;
+      if (defined('CIVICRM_LOGGING_DSN')) {
+        $dsn = DB::parseDSN(CRM_Utils_SQL::autoSwitchDSN(CIVICRM_LOGGING_DSN));
+        if (!empty($dsn['database'])) {
+          $this->loggingDatabase = (string) $dsn['database'];
+        }
+      }
+    }
+    return $this->loggingDatabase;
+  }
+
+  /**
+   * @return bool
+   */
+  public function hasSeparateLoggingDatabase() {
+    return $this->getLoggingDatabaseName() !== $this->database;
+  }
+
+  /**
+   * Problems met while reading the logging database.
    *
    * @return array
-   *   Keyed by table name. Each item contains:
+   */
+  public function getLoggingErrors() {
+    return array_values($this->loggingErrors);
+  }
+
+  /**
+   * Log tables in the logging database, as CRM_Logging_Schema lists them:
+   * log_civicrm_* plus the log tables of tables added through
+   * hook_civicrm_alterLogTables.
+   *
+   * @return array
+   *   Table name => TRUE.
+   */
+  protected function getLogTableNames() {
+    if ($this->logTableNames === NULL) {
+      $this->logTableNames = array_fill_keys((new CRM_Logging_Schema())->getLogTableNames(), TRUE);
+    }
+    return $this->logTableNames;
+  }
+
+  /**
+   * Name a table goes by in the analysis, queue, API and audit log: its own
+   * name in the CiviCRM database, "database.table" in a separate logging
+   * database.
+   *
+   * @param string $schema
+   * @param string $name
+   *
+   * @return string
+   */
+  public function getTableKey($schema, $name) {
+    return $schema === $this->database ? $name : "{$schema}.{$name}";
+  }
+
+  /**
+   * @param string $key
+   *
+   * @return array
+   *   [database, table name].
+   */
+  protected function splitTableKey($key) {
+    $loggingDb = $this->getLoggingDatabaseName();
+    if ($loggingDb !== $this->database && strpos($key, $loggingDb . '.') === 0) {
+      return [$loggingDb, substr($key, strlen($loggingDb) + 1)];
+    }
+    return [$this->database, $key];
+  }
+
+  /**
+   * SQL identifier for a table key, qualified with its database when that is
+   * not the CiviCRM database.
+   *
+   * @param string $key
+   *
+   * @return string
+   */
+  protected function quoteTable($key) {
+    [$schema, $name] = $this->splitTableKey($key);
+    $quoted = '`' . str_replace('`', '``', $name) . '`';
+    return $schema === $this->database ? $quoted : '`' . str_replace('`', '``', $schema) . '`.' . $quoted;
+  }
+
+  /**
+   * Whether a table key names a log table this tool converts.
+   *
+   * @param string $key
+   *
+   * @return bool
+   */
+  public function isLogTable($key) {
+    if (!$this->isLoggingEnabled()) {
+      return FALSE;
+    }
+    [$schema, $name] = $this->splitTableKey($key);
+    return $schema === $this->getLoggingDatabaseName() && isset($this->getLogTableNames()[$name]);
+  }
+
+  /**
+   * Order tables for conversion with log tables first. A log table on
+   * utf8mb4 accepts everything its trigger copies from a utf8 table, while a
+   * converted table's trigger cannot copy 4-byte characters into a log table
+   * that is still on utf8.
+   *
+   * @param array $keys
+   *
+   * @return array
+   */
+  public function orderForConversion(array $keys) {
+    $logs = array_filter($keys, [$this, 'isLogTable']);
+    return array_values(array_merge($logs, array_diff($keys, $logs)));
+  }
+
+  /**
+   * Analyze all InnoDB tables in the CiviCRM database, and the log tables
+   * when detailed logging is enabled.
+   *
+   * @param array|null $onlyTables
+   *   Optional list of table keys to restrict analysis to. The result keeps
+   *   their order.
+   *
+   * @return array
+   *   Keyed by table key (see getTableKey()). Each item contains:
    *   - table, engine, current_collation, target_collation
+   *   - database, is_log, base_table: the table's database, whether it is a
+   *     log table, and for a log table the table it logs
    *   - size_bytes, size_formatted, row_count
    *   - columns: list of columns needing change
    *   - skipped_columns: columns whose definitions cannot be converted safely
@@ -210,11 +374,9 @@ class CRM_Collationfix_Analyzer {
     $tables = $this->getTables();
     $sizes = $this->getTableSizes();
 
-    foreach ($tables as $table => $meta) {
-      if ($onlyTables !== NULL && !in_array($table, $onlyTables, TRUE)) {
-        continue;
-      }
-      $item = $this->analyzeTable($table, $meta);
+    $keys = $onlyTables === NULL ? array_keys($tables) : array_intersect($onlyTables, array_keys($tables));
+    foreach ($keys as $table) {
+      $item = $this->analyzeTable($table, $tables[$table]);
       $item['size_bytes'] = $sizes[$table]['size'] ?? 0;
       $item['size_formatted'] = self::formatBytes($item['size_bytes']);
       $item['row_count'] = $sizes[$table]['rows'] ?? 0;
@@ -225,16 +387,71 @@ class CRM_Collationfix_Analyzer {
     }
 
     $this->addIndexWarnings($result);
+    $this->addLoggingWarnings($result);
 
     return $result;
+  }
+
+  /**
+   * Warn when a table and its log table are not converted together. The
+   * logging trigger copies every saved value into the log table, so a
+   * 4-byte character saved to a converted table is rejected there (or
+   * stored as "?" without strict SQL mode) while the log table is on utf8.
+   *
+   * @param array $result
+   *   Analysis result, modified by reference.
+   */
+  protected function addLoggingWarnings(array &$result) {
+    foreach ($result as $key => $item) {
+      $base = $item['base_table'];
+      if (!$item['is_log'] || !$item['needs_change'] || !isset($result[$base])) {
+        continue;
+      }
+      if ($result[$base]['needs_change']) {
+        $result[$base]['warnings'][] = E::ts('Convert its log table %1 with it. Once this table is on utf8mb4, 4-byte characters saved to it are rejected by the log table (or stored as "?" without strict SQL mode) until the log table is converted too.', [1 => $key]);
+      }
+      else {
+        $result[$key]['warnings'][] = E::ts('%1 is already on utf8mb4, so 4-byte characters saved to it are rejected by this log table (or stored as "?" without strict SQL mode) until it is converted.', [1 => $base]);
+      }
+    }
+  }
+
+  /**
+   * Log tables that need conversion but are left out of a selection that
+   * includes the table they log.
+   *
+   * @param array $analysis
+   *   Analysis of the selected tables, keyed by table key.
+   *
+   * @return array
+   *   Table key => key of its log table.
+   */
+  public function findUnselectedLogTables(array $analysis) {
+    $missing = [];
+    if (!$this->isLoggingEnabled()) {
+      return $missing;
+    }
+    $tables = $this->getTables();
+    foreach ($analysis as $key => $item) {
+      if ($item['is_log']) {
+        continue;
+      }
+      $logKey = $this->getTableKey($this->getLoggingDatabaseName(), 'log_' . $key);
+      if (isset($tables[$logKey]) && !isset($analysis[$logKey])
+        && $this->analyzeTable($logKey, $tables[$logKey])['needs_change']) {
+        $missing[$key] = $logKey;
+      }
+    }
+    return $missing;
   }
 
   /**
    * Analyze a single table and build its ALTER statement.
    *
    * @param string $table
+   *   Table key, see getTableKey().
    * @param array|null $meta
-   *   Table meta from SHOW TABLE STATUS (Engine, Collation). Fetched when NULL.
+   *   Table meta from getTables(). Fetched when NULL.
    *
    * @return array
    */
@@ -242,13 +459,19 @@ class CRM_Collationfix_Analyzer {
     if ($meta === NULL) {
       $tables = $this->getTables();
       if (!isset($tables[$table])) {
-        throw new CRM_Core_Exception("Table not found or not InnoDB: {$table}");
+        throw new CRM_Core_Exception("Table not found or not convertible: {$table}");
       }
       $meta = $tables[$table];
     }
+    $isLog = !empty($meta['Is_log']);
 
     $item = [
       'table' => $table,
+      'database' => $meta['Schema'] ?? $this->database,
+      'is_log' => $isLog,
+      // A log table is named log_<table>; the table it logs is always in the
+      // CiviCRM database.
+      'base_table' => $isLog ? substr($meta['Name'], 4) : '',
       'engine' => $meta['Engine'],
       'current_collation' => $meta['Collation'],
       'target_collation' => $this->targetCollation,
@@ -288,8 +511,8 @@ class CRM_Collationfix_Analyzer {
       return $definitions[$field];
     };
 
-    $quotedTable = str_replace('`', '``', $table);
-    $dao = CRM_Core_DAO::executeQuery("SHOW FULL COLUMNS FROM `{$quotedTable}`");
+    $quotedTable = $this->quoteTable($table);
+    $dao = CRM_Core_DAO::executeQuery("SHOW FULL COLUMNS FROM {$quotedTable}");
     while ($dao->fetch()) {
       $collation = $dao->Collation;
       $extra = (string) $dao->Extra;
@@ -401,6 +624,9 @@ class CRM_Collationfix_Analyzer {
     }
 
     $item['needs_change'] = TRUE;
+    if ($meta['Engine'] === 'ARCHIVE') {
+      $item['warnings'][] = E::ts('ARCHIVE engine: the ALTER rewrites the whole table, which is slow for a large log table. To move log tables to InnoDB first, run the System.updatelogtables API with forceEngineMigration=1.');
+    }
     $lines = $modifyClauses;
     if ($tableIsUtf8) {
       // Stay binary only when the table itself is currently on a binary
@@ -409,7 +635,7 @@ class CRM_Collationfix_Analyzer {
       $lines[] = 'CHARACTER SET = ' . self::NEW_CHARSET . " COLLATE = {$tableCollation}" .
         ($setDynamic ? ' ROW_FORMAT = Dynamic KEY_BLOCK_SIZE = 0' : '');
     }
-    $item['alter'] = "ALTER TABLE `{$quotedTable}`\n  " . implode(",\n  ", $lines) . ';';
+    $item['alter'] = "ALTER TABLE {$quotedTable}\n  " . implode(",\n  ", $lines) . ';';
 
     return $item;
   }
@@ -511,8 +737,7 @@ class CRM_Collationfix_Analyzer {
 
   /** Read canonical DDL; never substitute an empty definition on failure. */
   protected function getCreateTable($table) {
-    $quoted = str_replace('`', '``', $table);
-    $dao = CRM_Core_DAO::executeQuery("SHOW CREATE TABLE `{$quoted}`");
+    $dao = CRM_Core_DAO::executeQuery("SHOW CREATE TABLE " . $this->quoteTable($table));
     if (!$dao->fetch() || empty($dao->Create_Table)) {
       throw new CRM_Core_Exception(E::ts('Cannot read the schema of %1.', [1 => $table]));
     }
@@ -595,31 +820,130 @@ class CRM_Collationfix_Analyzer {
   }
 
   /**
-   * Get all InnoDB tables with their engine, collation and row format.
+   * Get the tables this tool converts, keyed by table key: InnoDB civicrm_*
+   * tables in the CiviCRM database and, while detailed logging is enabled,
+   * InnoDB and ARCHIVE log tables in the logging database.
    *
    * @return array
+   *   Table key => [Schema, Name, Is_log, Engine, Collation, Row_format].
    */
   public function getTables() {
     $tables = [];
     $dao = CRM_Core_DAO::executeQuery("SHOW TABLE STATUS WHERE Name LIKE '" . self::CIVICRM_TABLE_PREFIX . "%' AND Engine = 'InnoDB'");
     while ($dao->fetch()) {
-      $tables[$dao->Name] = [
-        'Engine' => $dao->Engine,
-        'Collation' => $dao->Collation,
-        'Row_format' => $dao->Row_format,
-      ];
+      $tables[$dao->Name] = self::tableMeta($dao, $this->database, FALSE);
+    }
+    return $tables + $this->getLogTables();
+  }
+
+  /**
+   * Log tables to convert, keyed by table key. Empty while detailed logging
+   * is disabled. A logging database that cannot be read is reported through
+   * getLoggingErrors() rather than failing the whole analysis.
+   *
+   * @return array
+   */
+  protected function getLogTables() {
+    $tables = [];
+    if (!$this->isLoggingEnabled()) {
+      return $tables;
+    }
+    $schema = $this->getLoggingDatabaseName();
+    try {
+      $names = $this->getLogTableNames();
+      if (!$names) {
+        return $tables;
+      }
+      $dao = CRM_Core_DAO::executeQuery("SHOW TABLE STATUS FROM `" . str_replace('`', '``', $schema) . "`
+        WHERE Name LIKE '" . self::LOG_TABLE_PREFIX . "%' AND Engine IN ('" . implode("', '", self::LOG_TABLE_ENGINES) . "')");
+      while ($dao->fetch()) {
+        if (isset($names[$dao->Name])) {
+          $tables[$this->getTableKey($schema, $dao->Name)] = self::tableMeta($dao, $schema, TRUE);
+        }
+      }
+    }
+    catch (Exception $e) {
+      $this->loggingErrors[$e->getMessage()] = E::ts('Cannot read the log tables in the logging database %1, so they are not listed: %2', [
+        1 => $schema,
+        2 => $e->getMessage(),
+      ]);
     }
     return $tables;
   }
 
   /**
-   * CiviCRM tables outside this tool's scope that still use utf8/utf8mb3:
-   * non-InnoDB civicrm_* tables, and detailed-logging log_civicrm_* tables.
+   * @param object $dao
+   *   A SHOW TABLE STATUS row.
+   * @param string $schema
+   * @param bool $isLog
    *
    * @return array
-   *   Table name => ['engine' => ..., 'collation' => ..., 'reason' => ...].
+   */
+  protected static function tableMeta($dao, $schema, $isLog) {
+    return [
+      'Schema' => $schema,
+      'Name' => $dao->Name,
+      'Is_log' => $isLog,
+      'Engine' => $dao->Engine,
+      'Collation' => $dao->Collation,
+      'Row_format' => $dao->Row_format,
+    ];
+  }
+
+  /**
+   * CiviCRM tables outside this tool's scope that still use utf8/utf8mb3:
+   * non-InnoDB civicrm_* tables; log tables while detailed logging is
+   * disabled, or on an engine other than InnoDB/ARCHIVE; and log_civicrm_*
+   * tables left in the CiviCRM database when logging uses another one.
+   *
+   * @return array
+   *   Table key => ['engine' => ..., 'collation' => ..., 'reason' => ...].
    */
   public function getUncoveredTables() {
+    $tables = [];
+    foreach ($this->findLegacyTables($this->database, self::CIVICRM_TABLE_PREFIX . '%') as $name => $info) {
+      if ($info['engine'] !== 'InnoDB') {
+        $tables[$name] = $info + ['reason' => E::ts('%1 engine; only InnoDB tables are converted.', [1 => $info['engine']])];
+      }
+    }
+
+    $loggingDb = $this->getLoggingDatabaseName();
+    $logNames = $this->getLogTableNames();
+    foreach ($this->findLegacyTables($loggingDb, self::LOG_TABLE_PREFIX . '%') as $name => $info) {
+      if (!isset($logNames[$name])) {
+        continue;
+      }
+      if (!$this->isLoggingEnabled()) {
+        $reason = E::ts('Detailed logging is disabled, so log tables are not converted. If logging is enabled again, CiviCRM writes to this table, and 4-byte characters are rejected until it is converted.');
+      }
+      elseif (!in_array($info['engine'], self::LOG_TABLE_ENGINES, TRUE)) {
+        $reason = E::ts('%1 engine; only InnoDB and ARCHIVE log tables are converted. Logging triggers copy every change here, so 4-byte characters are still rejected until it is converted.', [1 => $info['engine']]);
+      }
+      else {
+        continue;
+      }
+      $tables[$this->getTableKey($loggingDb, $name)] = $info + ['reason' => $reason];
+    }
+
+    if ($loggingDb !== $this->database) {
+      foreach ($this->findLegacyTables($this->database, self::LOG_TABLE_PREFIX . self::CIVICRM_TABLE_PREFIX . '%') as $name => $info) {
+        $tables[$name] = $info + ['reason' => E::ts('Not in the logging database (%1), so CiviCRM does not write to it. It is not converted.', [1 => $loggingDb])];
+      }
+    }
+    return $tables;
+  }
+
+  /**
+   * Tables in a database whose default or any column is still utf8/utf8mb3.
+   *
+   * @param string $schema
+   * @param string $nameLike
+   *   LIKE pattern for the table names.
+   *
+   * @return array
+   *   Table name => ['engine' => ..., 'collation' => ...].
+   */
+  protected function findLegacyTables($schema, $nameLike) {
     $tables = [];
     $dao = CRM_Core_DAO::executeQuery("
       SELECT t.TABLE_NAME AS table_name, t.ENGINE AS engine, t.TABLE_COLLATION AS table_collation,
@@ -628,49 +952,58 @@ class CRM_Collationfix_Analyzer {
       LEFT JOIN information_schema.COLUMNS c
         ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
         AND c.TABLE_NAME = t.TABLE_NAME
-      WHERE t.TABLE_SCHEMA = DATABASE()
+      WHERE t.TABLE_SCHEMA = %1
         AND t.TABLE_TYPE = 'BASE TABLE'
-        AND (
-          (t.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%' AND t.ENGINE <> 'InnoDB')
-          OR t.TABLE_NAME LIKE 'log\_" . self::CIVICRM_TABLE_PREFIX . "%'
-        )
+        AND t.TABLE_NAME LIKE %2
       GROUP BY t.TABLE_NAME, t.ENGINE, t.TABLE_COLLATION
       HAVING legacy_columns > 0 OR table_collation LIKE 'utf8\_%' OR table_collation LIKE 'utf8mb3\_%'
       ORDER BY t.TABLE_NAME
-    ");
+    ", [1 => [$schema, 'String'], 2 => [$nameLike, 'String']]);
     while ($dao->fetch()) {
       $tables[$dao->table_name] = [
         'engine' => $dao->engine,
         'collation' => $dao->table_collation,
-        'reason' => (strpos($dao->table_name, 'log_') === 0)
-          ? E::ts('Detailed logging table. Logging triggers copy every change here, so 4-byte characters are still rejected until it is converted too.')
-          : E::ts('%1 engine; only InnoDB tables are converted.', [1 => $dao->engine]),
       ];
     }
     return $tables;
   }
 
   /**
-   * Get data+index size and row estimates from information_schema.
+   * Get data+index size and row estimates from information_schema, keyed by
+   * table key.
    *
    * @return array
    */
   protected function getTableSizes() {
     $sizes = [];
-    $dao = CRM_Core_DAO::executeQuery("
-      SELECT TABLE_NAME, (DATA_LENGTH + INDEX_LENGTH) AS size_bytes, TABLE_ROWS
-      FROM information_schema.TABLES
-      WHERE TABLE_SCHEMA = DATABASE()
-        AND TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
-        AND ENGINE = 'InnoDB'
-    ");
-    while ($dao->fetch()) {
-      $sizes[$dao->TABLE_NAME] = [
-        'size' => (int) $dao->size_bytes,
-        'rows' => (int) $dao->TABLE_ROWS,
-      ];
+    foreach ($this->getSchemaPatterns() as [$schema, $nameLike]) {
+      $dao = CRM_Core_DAO::executeQuery("
+        SELECT TABLE_NAME, (DATA_LENGTH + INDEX_LENGTH) AS size_bytes, TABLE_ROWS
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = %1
+          AND TABLE_NAME LIKE %2
+      ", [1 => [$schema, 'String'], 2 => [$nameLike, 'String']]);
+      while ($dao->fetch()) {
+        $sizes[$this->getTableKey($schema, $dao->TABLE_NAME)] = [
+          'size' => (int) $dao->size_bytes,
+          'rows' => (int) $dao->TABLE_ROWS,
+        ];
+      }
     }
     return $sizes;
+  }
+
+  /**
+   * Where the converted tables are: [database, table name LIKE pattern].
+   *
+   * @return array
+   */
+  protected function getSchemaPatterns() {
+    $patterns = [[$this->database, self::CIVICRM_TABLE_PREFIX . '%']];
+    if ($this->isLoggingEnabled()) {
+      $patterns[] = [$this->getLoggingDatabaseName(), self::LOG_TABLE_PREFIX . '%'];
+    }
+    return $patterns;
   }
 
   /**
@@ -684,30 +1017,33 @@ class CRM_Collationfix_Analyzer {
    *   Analysis result, modified by reference.
    */
   protected function addIndexWarnings(&$result) {
-    $dao = CRM_Core_DAO::executeQuery("
-      SELECT s.TABLE_NAME AS table_name, s.INDEX_NAME AS index_name,
-        s.COLUMN_NAME AS column_name, s.SUB_PART AS sub_part,
-        c.DATA_TYPE AS data_type, c.COLUMN_TYPE AS column_type,
-        c.CHARACTER_SET_NAME AS charset, c.CHARACTER_MAXIMUM_LENGTH AS char_length,
-        c.CHARACTER_OCTET_LENGTH AS octet_length,
-        c.NUMERIC_PRECISION AS numeric_precision, c.NUMERIC_SCALE AS numeric_scale,
-        c.DATETIME_PRECISION AS datetime_precision
-      FROM information_schema.STATISTICS s
-      LEFT JOIN information_schema.COLUMNS c
-        ON c.TABLE_SCHEMA = s.TABLE_SCHEMA
-        AND c.TABLE_NAME = s.TABLE_NAME
-        AND c.COLUMN_NAME = s.COLUMN_NAME
-      WHERE s.TABLE_SCHEMA = DATABASE()
-        AND s.TABLE_NAME LIKE '" . self::CIVICRM_TABLE_PREFIX . "%'
-        AND s.INDEX_TYPE = 'BTREE'
-      ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
-    ");
     $indexes = [];
-    while ($dao->fetch()) {
-      if (empty($result[$dao->table_name]['needs_change'])) {
-        continue;
+    foreach ($this->getSchemaPatterns() as [$schema, $nameLike]) {
+      $dao = CRM_Core_DAO::executeQuery("
+        SELECT s.TABLE_NAME AS table_name, s.INDEX_NAME AS index_name,
+          s.COLUMN_NAME AS column_name, s.SUB_PART AS sub_part,
+          c.DATA_TYPE AS data_type, c.COLUMN_TYPE AS column_type,
+          c.CHARACTER_SET_NAME AS charset, c.CHARACTER_MAXIMUM_LENGTH AS char_length,
+          c.CHARACTER_OCTET_LENGTH AS octet_length,
+          c.NUMERIC_PRECISION AS numeric_precision, c.NUMERIC_SCALE AS numeric_scale,
+          c.DATETIME_PRECISION AS datetime_precision
+        FROM information_schema.STATISTICS s
+        LEFT JOIN information_schema.COLUMNS c
+          ON c.TABLE_SCHEMA = s.TABLE_SCHEMA
+          AND c.TABLE_NAME = s.TABLE_NAME
+          AND c.COLUMN_NAME = s.COLUMN_NAME
+        WHERE s.TABLE_SCHEMA = %1
+          AND s.TABLE_NAME LIKE %2
+          AND s.INDEX_TYPE = 'BTREE'
+        ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
+      ", [1 => [$schema, 'String'], 2 => [$nameLike, 'String']]);
+      while ($dao->fetch()) {
+        $key = $this->getTableKey($schema, $dao->table_name);
+        if (empty($result[$key]['needs_change'])) {
+          continue;
+        }
+        $indexes[$key][$dao->index_name][] = (array) $dao;
       }
-      $indexes[$dao->table_name][$dao->index_name][] = (array) $dao;
     }
     foreach ($indexes as $table => $tableIndexes) {
       foreach ($tableIndexes as $name => $parts) {
@@ -801,12 +1137,21 @@ class CRM_Collationfix_Analyzer {
 
   /**
    * Quick count of tables with a utf8/utf8mb3 default or any utf8/utf8mb3
-   * column (used by the status check).
+   * column (used by the status check), including the log tables this tool
+   * converts while detailed logging is enabled.
    *
    * @return int
    */
   public static function countNonUtf8mb4Tables() {
-    return (int) CRM_Core_DAO::singleValueQuery("
+    $analyzer = new self();
+    $logTables = 0;
+    if ($analyzer->isLoggingEnabled()) {
+      $logNames = $analyzer->getLogTableNames();
+      foreach ($analyzer->findLegacyTables($analyzer->getLoggingDatabaseName(), self::LOG_TABLE_PREFIX . '%') as $name => $info) {
+        $logTables += (int) (isset($logNames[$name]) && in_array($info['engine'], self::LOG_TABLE_ENGINES, TRUE));
+      }
+    }
+    return $logTables + (int) CRM_Core_DAO::singleValueQuery("
       SELECT COUNT(*) FROM (
         SELECT TABLE_NAME
         FROM information_schema.TABLES

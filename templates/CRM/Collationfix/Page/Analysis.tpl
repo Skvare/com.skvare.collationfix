@@ -7,6 +7,15 @@
       {ts}Server{/ts}: <strong>{$serverVersion|escape}</strong>{if $isMariaDb} ({ts}MariaDB{/ts}){else} ({ts}MySQL{/ts}){/if} &nbsp;|&nbsp;
       {ts}Target collation{/ts}: <strong>{$targetCollation|escape}</strong> (<a href="{$settingsUrl}">{ts}change{/ts}</a>)
     </p>
+    <p>
+      {ts}Detailed logging{/ts}:
+      {if $loggingEnabled}
+        <strong>{ts}enabled{/ts}</strong> &nbsp;|&nbsp;
+        {ts}Logging database{/ts}: <strong>{$loggingDatabaseName|escape}</strong>{if $separateLoggingDatabase} ({ts}separate database, from CIVICRM_LOGGING_DSN{/ts}){/if}
+      {else}
+        <strong>{ts}disabled{/ts}</strong> &nbsp;|&nbsp; {ts}Log tables are not listed or converted while logging is disabled.{/ts}
+      {/if}
+    </p>
     {if $serverDetails}
       <table class="report-layout collationfix-server-details" style="width:auto; margin:0.5em 0;">
         <thead>
@@ -36,6 +45,20 @@
       <td><strong>{ts}Data size affected{/ts}</strong><br/><span style="font-size:1.6em;">{$totalSize}</span></td>
     </tr>
   </table>
+
+  {if $loggingErrors}
+    <div class="messages error no-popup">
+      {foreach from=$loggingErrors item=error}
+        <p>{$error|escape}</p>
+      {/foreach}
+    </div>
+  {/if}
+
+  {if $logTablesNeedingChange}
+    <div class="messages warning no-popup">
+      <p>{ts 1=$logTablesNeedingChange}%1 detailed-logging tables need conversion. Convert each one together with the table it logs: logging triggers copy every saved value into the log table, so 4-byte characters are rejected there while it is still on utf8. Log tables are converted first. While a log table's ALTER runs, saves to the table it logs wait for it to finish; log tables are often the largest tables, so consider converting them from the command line.{/ts}</p>
+    </div>
+  {/if}
 
   {if $uncoveredTables}
     <div class="messages warning no-popup">
@@ -81,7 +104,7 @@
                 <input type="checkbox" name="tables[]" value="{$table|escape}" class="collationfix-check" checked/>
               {/if}
             </td>
-            <td><code>{$table|escape}</code></td>
+            <td><code>{$table|escape}</code>{if $item.is_log} <span class="crm-tag-item">{ts}Log{/ts}</span>{/if}</td>
             <td>{$item.current_collation|escape}</td>
             <td>{if $item.needs_change}{$item.target_collation|escape}{else}-{/if}</td>
             <td>{$item.columns|@count}</td>

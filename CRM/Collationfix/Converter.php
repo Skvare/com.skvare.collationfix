@@ -14,7 +14,8 @@ class CRM_Collationfix_Converter {
    * Build a queue with one conversion task per table.
    *
    * @param array $tables
-   *   Table names to convert.
+   *   Table keys to convert (see CRM_Collationfix_Analyzer::getTableKey()).
+   *   Log tables are queued before the other tables.
    * @param string|null $targetCollation
    *   The confirmed target collation. Every task converts to it, even if the
    *   setting changes while the queue runs.
@@ -27,6 +28,7 @@ class CRM_Collationfix_Converter {
   public static function buildQueue(array $tables, $targetCollation = NULL, ?array $reviewed = NULL) {
     $analyzer = new CRM_Collationfix_Analyzer($targetCollation);
     $targetCollation = $analyzer->getTargetCollation();
+    $tables = $analyzer->orderForConversion($tables);
     $plans = [];
     // Validate all tables before creating a queue. Never replace the plan
     // saved by the confirmation form with a freshly generated approval.
@@ -81,6 +83,7 @@ class CRM_Collationfix_Converter {
    * Convert one table, timing the ALTER and recording the outcome.
    *
    * @param string $table
+   *   Table key; "database.table" for a table in a separate logging database.
    * @param string|null $targetCollation
    *   Defaults to the target collation setting.
    * @param array|null $plan

@@ -1,9 +1,10 @@
 # Collation Fix — utf8mb4 Conversion Toolkit (com.skvare.collationfix)
 
-Audits every `civicrm_*` InnoDB table in the CiviCRM database for legacy
-`utf8` / `utf8mb3` collations, shows exactly what would change (per column), and
-converts selected tables to `utf8mb4` through a queue with progress tracking
-and a permanent audit log.
+Audits every `civicrm_*` InnoDB table in the CiviCRM database (and, while
+detailed logging is enabled, its log tables) for legacy `utf8` / `utf8mb3`
+collations, shows exactly what would change (per column), and converts
+selected tables to `utf8mb4` through a queue with progress tracking and a
+permanent audit log.
 
 Tables still on 3-byte utf8 cannot store emoji or other 4-byte characters —
 inserts fail with `Incorrect string value` errors. CiviCRM core ships a blunt
@@ -41,9 +42,15 @@ alternative:
   `innodb_default_row_format`, `innodb_page_size`, `max_allowed_packet`)
   are shown right on the analysis page, each with a help icon explaining
   what it means for the conversion.
+* **Detailed-logging tables** — while CiviCRM's detailed logging is enabled,
+  the log tables are analyzed and converted too, in the same database or in
+  the separate one named by `CIVICRM_LOGGING_DSN`. See
+  [Detailed logging](#detailed-logging).
 * **Scope report** — the analysis page lists CiviCRM tables this tool
-  doesn't convert that still use 3-byte utf8: non-InnoDB `civicrm_*` tables
-  and detailed-logging `log_civicrm_*` tables.
+  doesn't convert that still use 3-byte utf8: non-InnoDB `civicrm_*` tables,
+  log tables while logging is disabled or on an engine other than InnoDB or
+  ARCHIVE, and `log_civicrm_*` tables left in the CiviCRM database when
+  logging uses a separate one.
 * **Queue-based execution** — one table per task via `CRM_Queue` with a
   progress bar. A single large ALTER can still exceed a web request timeout;
   use the CLI for large tables and inspect any interrupted audit records.
@@ -64,7 +71,8 @@ alternative:
   from `cv`, `drush` or `wp-cli`, so large tables are never cut off by a web
   request timeout. Same verification and audit log as the UI.
 * **System status check** — warns on the CiviCRM status page while any
-  table default or column remains on 3-byte utf8.
+  table default or column remains on 3-byte utf8, counting log tables while
+  detailed logging is enabled.
 
 Works with MySQL 5.7 / 8.x (`utf8_*` and `utf8mb3_*` collation names) and
 MariaDB.
@@ -91,6 +99,43 @@ This is an [extension for CiviCRM](https://docs.civicrm.org/sysadmin/en/latest/c
    The conversion runs as a queue with a progress bar and lands on the
    conversion log when done.
 
+## Detailed logging
+
+When detailed logging is enabled (**Administer → System Settings → Misc →
+Logging**), triggers copy every change to a CiviCRM table into its log table,
+`log_civicrm_*`. A table converted to utf8mb4 then passes 4-byte characters to
+its trigger, and a log table still on utf8 rejects them: the whole save fails
+with `Incorrect string value` (or, without strict SQL mode, the log stores
+`?`). So a table is only fully converted once its log table is too.
+
+* **Only while logging is enabled.** Log tables are listed and converted only
+  while the `logging` setting is on. With logging off nothing writes to them;
+  any still on utf8 are shown in the scope report instead, because they are
+  reused if logging is turned on again.
+* **Which tables.** The log tables CiviCRM itself knows about
+  (`CRM_Logging_Schema`): `log_civicrm_*` plus those of tables added through
+  `hook_civicrm_alterLogTables`. InnoDB and ARCHIVE log tables are converted;
+  ARCHIVE tables keep their engine, and get a warning because their ALTER
+  rewrites the whole table. To move them to InnoDB first, run
+  `cv api System.updatelogtables forceEngineMigration=1`.
+* **Separate logging database.** When `CIVICRM_LOGGING_DSN` names another
+  database, its log tables are shown and passed as `database.table` (for
+  example `civicrm_logs.log_civicrm_contact`) on the analysis page, in the
+  downloaded SQL, in the API and in the audit log. Like CiviCRM core, the
+  tool reaches that database through the CiviCRM connection, so the CiviCRM
+  database user needs `ALTER` on it; without it the ALTER fails, changes
+  nothing and is recorded as an error. The confirmation screen then also asks
+  for the logging database name.
+* **Convert both together.** Every table that needs conversion warns when
+  its log table needs it too, and the confirmation screen lists selected
+  tables whose log table is not selected. Log tables are always converted
+  first, which is safe: a log table on utf8mb4 accepts everything a utf8
+  table sends it.
+* **Locking.** While a log table's ALTER runs, saves to the table it logs
+  wait for it, because the trigger writes to the log table. Log tables are
+  often the largest tables in the database; convert them from the command
+  line, in a quiet period.
+
 ## Command Line
 
 For large tables, convert from the command line instead of the browser. The
@@ -113,9 +158,11 @@ drush civicrm-api Collationfix.convert tables=civicrm_contact
 wp civicrm api Collationfix.convert tables=civicrm_contact
 ```
 
-* `tables` — one or more `civicrm_*` InnoDB tables, as a comma-separated
-  string or an array. Required unless `dry_run` is set. Every name is
-  checked before anything runs; an unknown name stops the whole call.
+* `tables` — one or more `civicrm_*` InnoDB tables, or log tables while
+  detailed logging is enabled (`database.log_civicrm_*` for a separate
+  logging database), as a comma-separated string or an array. Required
+  unless `dry_run` is set. Every name is checked before anything runs; an
+  unknown name stops the whole call. Log tables are converted first.
 * `dry_run` — return each table's generated statement, columns and warnings
   without executing anything. Without `tables`, every table is analyzed.
   Results also include `blocked`, `errors`, and `schema_fingerprint`.
@@ -132,15 +179,16 @@ lag on replicated setups.
 ## Scope / Known Issues
 
 * Operates on the database `CIVICRM_DSN` connects to, and only on tables
-  whose names start with `civicrm_`. On a shared Drupal/WordPress database
-  the CMS's own tables (`users`, `node`, `sessions`, etc.) are not listed or
-  converted. Neither are CiviCRM detailed-logging tables (`log_civicrm_*`)
-  or extension tables that use another prefix (e.g. CiviRules'
-  `civirule_*`). Convert those separately if needed. The analysis page
-  lists the `log_civicrm_*` tables that still need it.
-* Only analyzes tables using the `InnoDB` engine; tables on other engines
-  (e.g. `MyISAM`/`Aria`) are not converted, even if they are still on a
-  legacy utf8 collation. They are listed in the analysis page's scope report.
+  whose names start with `civicrm_`, plus the detailed-logging tables while
+  logging is enabled (see [Detailed logging](#detailed-logging)). On a
+  shared Drupal/WordPress database the CMS's own tables (`users`, `node`,
+  `sessions`, etc.) are not listed or converted. Neither are extension
+  tables that use another prefix (e.g. CiviRules' `civirule_*`). Convert
+  those separately if needed.
+* Only analyzes `civicrm_*` tables using the `InnoDB` engine, and log tables
+  using `InnoDB` or `ARCHIVE`; tables on other engines (e.g. `MyISAM`/`Aria`)
+  are not converted, even if they are still on a legacy utf8 collation. They
+  are listed in the analysis page's scope report.
 * Assumes the default SQL mode handling of backslashes. Like CiviCRM core,
   its `LIKE 'civicrm\_%'` table filters find nothing under
   `NO_BACKSLASH_ESCAPES`.
@@ -161,6 +209,8 @@ lag on replicated setups.
 Run `php tests/regression.php` from the extension directory. These standalone
 tests simulate CiviCRM and database responses and never connect to a database.
 They cover SQL parsing, blocked tables, schema drift, queue/form review state,
-audit ordering, verification failures, API results and composite index sizes.
+audit ordering, verification failures, API results, composite index sizes,
+and detailed-logging tables (logging on/off, separate logging database,
+ARCHIVE log tables, conversion order and the scope report).
 They complement, rather than replace, conversion tests on disposable MySQL
 and MariaDB databases.

@@ -10,7 +10,7 @@ use CRM_Collationfix_ExtensionUtil as E;
 function _civicrm_api3_collationfix_convert_spec(&$spec) {
   $spec['tables'] = [
     'title' => E::ts('Tables'),
-    'description' => E::ts('One or more civicrm_* InnoDB tables, as an array or a comma-separated string. Required unless dry_run is set; a dry run without tables analyzes every table.'),
+    'description' => E::ts('One or more civicrm_* InnoDB tables, or log tables while detailed logging is enabled ("database.log_civicrm_*" when they are in a separate logging database), as an array or a comma-separated string. Required unless dry_run is set; a dry run without tables analyzes every table.'),
   ];
   $spec['dry_run'] = [
     'title' => E::ts('Dry run'),
@@ -51,7 +51,7 @@ function civicrm_api3_collationfix_convert($params) {
   $analyzer = new CRM_Collationfix_Analyzer();
   $unknown = array_diff($tables, array_keys($analyzer->getTables()));
   if ($unknown) {
-    throw new CRM_Core_Exception(E::ts('Not a civicrm_* InnoDB table: %1', [1 => implode(', ', $unknown)]));
+    throw new CRM_Core_Exception(E::ts('Not a table this tool converts: %1. Use the names a dry run lists; log tables are included only while detailed logging is enabled.', [1 => implode(', ', $unknown)]));
   }
 
   $values = [];
@@ -59,6 +59,8 @@ function civicrm_api3_collationfix_convert($params) {
     foreach ($analyzer->analyze($tables ?: NULL) as $table => $item) {
       $values[$table] = [
         'table_name' => $table,
+        'database' => $item['database'],
+        'is_log' => $item['is_log'],
         'needs_change' => $item['needs_change'],
         'blocked' => $item['blocked'],
         'errors' => $item['errors'],
@@ -74,11 +76,12 @@ function civicrm_api3_collationfix_convert($params) {
     return civicrm_api3_create_success($values, $params, 'Collationfix', 'convert');
   }
 
-  // Like the UI queue, carry on past a failed table; report failures at the
-  // end so CLI callers get a non-zero exit. Every table converts to the
-  // target collation read at the start of the call.
+  // Like the UI queue, carry on past a failed table, and convert log tables
+  // first; report failures at the end so CLI callers get a non-zero exit.
+  // Every table converts to the target collation read at the start of the
+  // call.
   $failed = [];
-  foreach ($tables as $table) {
+  foreach ($analyzer->orderForConversion($tables) as $table) {
     $values[$table] = CRM_Collationfix_Converter::convertTable($table, $analyzer->getTargetCollation());
     if ($values[$table]['status'] === 'error') {
       $failed[] = $table;

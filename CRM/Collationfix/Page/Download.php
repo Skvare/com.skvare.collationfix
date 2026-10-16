@@ -16,10 +16,15 @@ class CRM_Collationfix_Page_Download extends CRM_Core_Page {
       $tables = array_map('strval', $_POST['tables']);
     }
     $analysis = $analyzer->analyze($tables);
+    // Same order as the conversion queue: log tables first.
+    $analysis = array_replace(array_flip($analyzer->orderForConversion(array_keys($analysis))), $analysis);
 
     $lines = [
       '-- Collation Fix (com.skvare.collationfix)',
       '-- Database: ' . $analyzer->getDatabaseName(),
+      '-- Logging database: ' . ($analyzer->isLoggingEnabled()
+        ? $analyzer->getLoggingDatabaseName()
+        : 'none (detailed logging is disabled; log tables are not included)'),
       '-- Server: ' . $analyzer->getServerVersion(),
       '-- Target collation: ' . $analyzer->getTargetCollation(),
       '-- Tables: ' . ($tables === NULL ? 'all that need a change' : 'selected on the analysis page'),
