@@ -28,8 +28,17 @@
 {/htxt}
 
 {htxt id="collation_connection"}
-  <p>{ts}The collation of text values sent over the current connection. After SET NAMES utf8mb4 it is the server's default utf8mb4 collation, for example utf8mb4_0900_ai_ci on MySQL 8 or utf8mb4_general_ci on MariaDB.{/ts}</p>
-  <p>{ts}When a value is compared with a column, the column's collation normally wins, so a difference here is usually harmless. It can cause "Illegal mix of collations" errors in queries that use SQL variables or stored functions. The same error occurs when two columns with the same character set but different collations are compared, such as a utf8mb4_unicode_ci table joined to a utf8mb4_0900_ai_ci one; converting every table to the same target collation avoids that.{/ts}</p>
+  <p>{ts}The collation of text values sent over the current connection, such as values written into a query. CiviCRM connects with SET NAMES utf8mb4 without naming a collation, so this is the server's built-in default for utf8mb4: utf8mb4_0900_ai_ci on MySQL 8, usually utf8mb4_general_ci on MariaDB. It does not follow collation_server or collation_database, so changing those does not change it. A difference from the table collation is normal for CiviCRM on MySQL 8.{/ts}</p>
+  <p>{ts}Ordinary queries are not affected: when a column is compared with a value, the column's collation wins and the column's index is still used.{/ts}</p>
+  <p>{ts}An "Illegal mix of collations" error occurs when a column is compared with:{/ts}</p>
+  <ul>
+    <li>{ts}a session variable (@name), which takes the connection collation;{/ts}</li>
+    <li>{ts}the result of CAST(... AS CHAR), which also takes the connection collation;{/ts}</li>
+    <li>{ts}a column on a different collation, such as a utf8mb4_unicode_ci table joined to a utf8mb4_0900_ai_ci one. Converting every table to the same target collation avoids this; watch tables this tool does not convert that your own queries join to CiviCRM tables;{/ts}</li>
+    <li>{ts}a parameter or variable of a stored function or procedure created while the database had a different default collation. Routines take the database default from when they were created; ones created since then match it.{/ts}</li>
+  </ul>
+  <p>{ts}In your own SQL, fix the error by giving the value an explicit collation. The column's index is still used:{/ts}</p>
+  <pre>WHERE display_name = @value COLLATE {$params.collation|escape}</pre>
 {/htxt}
 
 {htxt id="innodb_file_per_table"}

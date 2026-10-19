@@ -12,9 +12,24 @@
       <li>{ts}If a selected table's schema changes after this review, its conversion is stopped and a new review is required.{/ts}</li>
       {if $hasLogTables}
         <li>{ts}Log tables are converted first. While a log table's ALTER runs, saves to the table it logs wait for it to finish, because the logging trigger writes to the log table.{/ts}</li>
+        <li>{ts}If a log table fails to convert, the table it logs is left unchanged in this run, and recorded as an error.{/ts}</li>
+      {/if}
+      {if $warningCount}
+        <li><strong>{ts 1=$warningCount}%1 selected tables have warnings, shown under each table below. Read them before converting.{/ts}</strong></li>
       {/if}
     </ul>
   </div>
+
+  {if $indexLimitTables}
+    <div class="messages error no-popup">
+      <p>{ts}The ALTER for these tables will fail: an index will be over the InnoDB index key limit once its columns take 4 bytes per character. Shorten the index (for example with a prefix length) first, or leave these tables out.{/ts}</p>
+      <ul>
+        {foreach from=$indexLimitTables item=table}
+          <li><code>{$table|escape}</code></li>
+        {/foreach}
+      </ul>
+    </div>
+  {/if}
 
   {if $unselectedLogTables}
     <div class="messages warning no-popup">
@@ -46,6 +61,19 @@
           <td>{$item.columns|@count}</td>
           <td>{$item.size_formatted|escape}</td>
         </tr>
+        {if $item.warnings}
+          <tr>
+            <td colspan="5">
+              <div class="messages warning no-popup" style="margin:0;">
+                <ul>
+                  {foreach from=$item.warnings item=warning}
+                    <li>{$warning|escape}</li>
+                  {/foreach}
+                </ul>
+              </div>
+            </td>
+          </tr>
+        {/if}
         {if $item.alter}
           <tr>
             <td colspan="5"><details><summary>{ts}Review SQL{/ts}</summary><pre style="white-space:pre-wrap;">{$item.alter|escape}</pre></details></td>

@@ -119,12 +119,12 @@ class CRM_Core_DAO {
       return new TestRows(self::like(self::$legacy[$schema] ?? [], 'table_name', $params[2][0]));
     }
     if (strpos($sql, 'INSERT INTO civicrm_collationfix_log') === 0 || strpos($sql, 'UPDATE civicrm_collationfix_log') === 0) {
-      self::$events[] = ['operation' => strtok($sql, ' '), 'status' => $params[6][0], 'table' => $params[1][0]];
+      self::$events[] = ['operation' => strtok($sql, ' '), 'status' => $params[6][0], 'table' => $params[1][0], 'message' => $params[7][0]];
       return new TestRows([]);
     }
     if (strpos($sql, 'ALTER TABLE') === 0) {
       self::$events[] = ['operation' => 'ALTER', 'sql' => $sql];
-      if (self::$onAlter) { call_user_func(self::$onAlter); }
+      if (self::$onAlter) { call_user_func(self::$onAlter, $sql); }
       return new TestRows([]);
     }
     throw new Exception('Unexpected query: ' . $sql);
@@ -182,6 +182,22 @@ function refuses(callable $call) {
 }
 function hasAlter() {
   return in_array('ALTER', array_column(CRM_Core_DAO::$events, 'operation'), TRUE);
+}
+/** SQL of every ALTER run so far. */
+function alters() {
+  return array_column(array_filter(CRM_Core_DAO::$events, function ($e) { return $e['operation'] === 'ALTER'; }), 'sql');
+}
+/** Log table conversion either fails or converts its own columns only. */
+function logAlter($fail) {
+  CRM_Core_DAO::$logColumns = CRM_Core_DAO::$columns;
+  CRM_Core_DAO::$onAlter = function ($sql) use ($fail) {
+    if (strpos($sql, 'log_civicrm_probe') === FALSE) {
+      CRM_Core_DAO::$meta['Collation'] = CRM_Core_DAO::$columns[0]['Collation'] = Civi::$target;
+      return;
+    }
+    if ($fail) { throw new Exception('Lock wait timeout exceeded'); }
+    CRM_Core_DAO::$logTables[0]['Collation'] = CRM_Core_DAO::$logColumns[0]['Collation'] = Civi::$target;
+  };
 }
 function schema($definition, $suffix = '') {
   return "CREATE TABLE `civicrm_probe` (\n  " . $definition . "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8" . $suffix;
@@ -410,14 +426,14 @@ $tests['separate logging database tables are qualified in keys and SQL'] = funct
   expect($log['size_bytes'] === 200, 'Log table size missing');
   contains("ALTER TABLE `test_logs`.`log_civicrm_probe`\n", $log['alter']);
   contains('ROW_FORMAT = Dynamic', $log['alter']);
-  contains("ALTER TABLE `civicrm_probe`\n", $analysis['civicrm_probe']['alter']);
+  contains("ALTER TABLE `test_database`.`civicrm_probe`\n", $analysis['civicrm_probe']['alter']);
   expect(in_array('SHOW CREATE TABLE `test_logs`.`log_civicrm_probe`', CRM_Core_DAO::$queries, TRUE), 'Log schema read from the wrong database');
 };
 $tests['log tables in the CiviCRM database keep bare names'] = function () {
   enableLogging('test_database');
   $analysis = (new CRM_Collationfix_Analyzer())->analyze();
   expect(isset($analysis['log_civicrm_probe']) && $analysis['log_civicrm_probe']['is_log'], 'Same-database log table missing');
-  contains("ALTER TABLE `log_civicrm_probe`\n", $analysis['log_civicrm_probe']['alter']);
+  contains("ALTER TABLE `test_database`.`log_civicrm_probe`\n", $analysis['log_civicrm_probe']['alter']);
 };
 $tests['tables not listed by the logging schema are ignored'] = function () {
   enableLogging();
@@ -519,6 +535,76 @@ $tests['unreadable logging database is reported rather than fatal'] = function (
   $analyzer = new CRM_Collationfix_Analyzer();
   expect(array_keys($analyzer->analyze()) === ['civicrm_probe'], 'Analysis failed with an unreadable logging database');
   contains('Access denied to logging database', implode(' ', $analyzer->getLoggingErrors()));
+};
+
+$tests['a table is left unchanged when its log table fails in the same queue'] = function () {
+  enableLogging();
+  logAlter(TRUE);
+  $queue = CRM_Collationfix_Converter::buildQueue(['civicrm_probe', 'test_logs.log_civicrm_probe']);
+  expect(($queue->items[1]->arguments[2]['log_table'] ?? NULL) === 'test_logs.log_civicrm_probe', 'Plan does not name the log table');
+  foreach ($queue->items as $task) {
+    CRM_Collationfix_Converter::convertTableTask(new CRM_Queue_TaskContext(), ...$task->arguments);
+  }
+  $alters = alters();
+  expect(count($alters) === 1 && strpos($alters[0], 'log_civicrm_probe') !== FALSE, 'Table converted although its log table failed');
+  $last = end(CRM_Core_DAO::$events);
+  expect($last['table'] === 'civicrm_probe' && $last['status'] === 'error', 'Unconverted table not recorded as an error');
+  contains('test_logs.log_civicrm_probe did not convert in this run', $last['message']);
+};
+$tests['a table converts after its log table succeeds in the same queue'] = function () {
+  enableLogging();
+  logAlter(FALSE);
+  $queue = CRM_Collationfix_Converter::buildQueue(['civicrm_probe', 'test_logs.log_civicrm_probe']);
+  foreach ($queue->items as $task) {
+    CRM_Collationfix_Converter::convertTableTask(new CRM_Queue_TaskContext(), ...$task->arguments);
+  }
+  expect(count(alters()) === 2, 'Both tables were not converted');
+  expect(array_column(CRM_Core_DAO::$events, 'status', 'table') === ['test_logs.log_civicrm_probe' => 'success', 'civicrm_probe' => 'success'], 'Pair did not convert cleanly');
+};
+$tests['API leaves a table unchanged when its log table fails in the same call'] = function () {
+  enableLogging();
+  logAlter(TRUE);
+  $result = civicrm_api3_collationfix_convert(['tables' => 'civicrm_probe,test_logs.log_civicrm_probe']);
+  expect($result['is_error'] === 1 && count(alters()) === 1, 'API converted a table whose log table failed');
+  contains('did not convert in this run', $result['values']['civicrm_probe']['error_message']);
+};
+$tests['a table alone is not held back by an unselected log table'] = function () {
+  enableLogging();
+  logAlter(TRUE);
+  $queue = CRM_Collationfix_Converter::buildQueue(['civicrm_probe']);
+  expect(!isset($queue->items[0]->arguments[2]['log_table']), 'Unselected log table became a dependency');
+};
+$tests['statuses tell legacy utf8, other collations, matches and other charsets apart'] = function () {
+  expect(analyze()['status'] === 'legacy', 'utf8 table not legacy');
+  CRM_Core_DAO::$meta['Collation'] = CRM_Core_DAO::$columns[0]['Collation'] = 'utf8mb4_general_ci';
+  $item = analyze();
+  expect($item['needs_change'] && $item['status'] === 'collation', 'Other utf8mb4 collation not reported as such');
+  CRM_Core_DAO::$meta['Collation'] = CRM_Core_DAO::$columns[0]['Collation'] = 'utf8mb4_unicode_ci';
+  expect(analyze()['status'] === 'ok', 'Matching table not OK');
+  CRM_Core_DAO::$meta['Collation'] = CRM_Core_DAO::$columns[0]['Collation'] = 'latin1_swedish_ci';
+  $item = analyze();
+  expect(!$item['needs_change'] && $item['status'] === 'out_of_scope', 'latin1 table reported as OK');
+  expect($item['other_charsets'] === ['table default (latin1_swedish_ci)', 'v (latin1_swedish_ci)'], 'latin1 parts not listed');
+};
+$tests['a utf8 table with a latin1 column converts the rest and warns'] = function () {
+  CRM_Core_DAO::$columns[] = ['Field' => 'old', 'Type' => 'varchar(10)', 'Collation' => 'latin1_swedish_ci', 'Extra' => '', 'Null' => 'YES', 'Comment' => '', 'Default' => NULL];
+  $item = analyze();
+  expect($item['status'] === 'legacy' && strpos($item['alter'], '`old`') === FALSE, 'latin1 column was converted');
+  contains('old (latin1_swedish_ci)', implode(' ', $item['warnings']));
+};
+$tests['every statement names its database'] = function () {
+  contains("ALTER TABLE `test_database`.`civicrm_probe`\n", analyze()['alter']);
+  expect(in_array('SHOW CREATE TABLE `test_database`.`civicrm_probe`', CRM_Core_DAO::$queries, TRUE), 'Schema read without its database');
+};
+$tests['confirmation shows warnings and index-limit failures'] = function () {
+  CRM_Core_DAO::$indexes = [part('varchar', ['charset' => 'utf8', 'char_length' => 768, 'octet_length' => 2304]), part('int')];
+  $_POST = ['tables' => ['civicrm_probe']];
+  $form = new CRM_Collationfix_Form_Convert();
+  $form->preProcess();
+  $form->buildQuickForm();
+  expect($form->assigned['indexLimitTables'] === ['civicrm_probe'], 'Index-limit failure not reported');
+  expect($form->assigned['warningCount'] === 1, 'Warning count wrong');
+  contains('3076 bytes', implode(' ', $form->assigned['tables']['civicrm_probe']['warnings']));
 };
 
 $failed = 0;

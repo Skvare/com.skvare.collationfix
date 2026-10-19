@@ -39,6 +39,12 @@ class CRM_Collationfix_Converter {
         self::assertPlanMatches($item, $reviewed[$table] ?? []);
       }
       $plans[$table] = ['schema_fingerprint' => $item['schema_fingerprint'], 'alter' => $item['alter']];
+      // A table whose log table is in this run waits for it, see
+      // convertTable().
+      $logTable = $analyzer->getLogTableKey($table);
+      if ($logTable !== NULL && in_array($logTable, $tables, TRUE)) {
+        $plans[$table]['log_table'] = $logTable;
+      }
     }
     // Unique per run so two conversions started around the same time (two
     // admins, two tabs, a double-submit) can never reset/clobber each
@@ -69,13 +75,15 @@ class CRM_Collationfix_Converter {
    * @param string $table
    * @param string|null $targetCollation
    * @param array|null $plan
-   *   Reviewed schema fingerprint and ALTER statement.
+   *   Reviewed schema fingerprint and ALTER statement, and the log table
+   *   converted earlier in the same run, if any.
    *
    * @return bool
    */
   public static function convertTableTask(CRM_Queue_TaskContext $ctx, $table, $targetCollation = NULL, ?array $plan = NULL) {
-    self::convertTable($table, $targetCollation, $plan ?? []);
-    // Always continue the queue; failures are recorded in the log.
+    self::convertTable($table, $targetCollation, $plan ?? [], $plan['log_table'] ?? NULL);
+    // Always continue the queue; failures are recorded in the log. A table
+    // whose log table failed is left unchanged by convertTable().
     return TRUE;
   }
 
@@ -89,11 +97,16 @@ class CRM_Collationfix_Converter {
    * @param array|null $plan
    *   Optional reviewed plan. Direct CLI conversion analyzes immediately;
    *   queued conversion must provide its saved plan.
+   * @param string|null $logTable
+   *   This table's log table, when it was converted earlier in the same run.
+   *   If it still needs conversion (its ALTER failed or was blocked), this
+   *   table is left unchanged and the run records an error for it, so the
+   *   pair stays consistent until the log table is fixed.
    *
    * @return array
    *   The log record that was written.
    */
-  public static function convertTable($table, $targetCollation = NULL, ?array $plan = NULL) {
+  public static function convertTable($table, $targetCollation = NULL, ?array $plan = NULL, $logTable = NULL) {
     $analyzer = NULL;
     $log = [
       'table_name' => $table,
@@ -120,6 +133,9 @@ class CRM_Collationfix_Converter {
         $log['error_message'] = E::ts('No change required.');
       }
       else {
+        if ($logTable !== NULL) {
+          self::assertLogTableConverted($analyzer, $logTable);
+        }
         $log['statement'] = $item['alter'];
         // Record the attempt first, so a request killed mid-ALTER leaves a
         // 'running' row rather than no trace at all.
@@ -181,6 +197,21 @@ class CRM_Collationfix_Converter {
         1 => $item['table'],
         2 => implode(' ', $item['errors']),
       ]));
+    }
+  }
+
+  /**
+   * Refuse to convert a table while its log table, converted earlier in the
+   * same run, still needs conversion.
+   *
+   * @param CRM_Collationfix_Analyzer $analyzer
+   * @param string $logTable
+   */
+  protected static function assertLogTableConverted(CRM_Collationfix_Analyzer $analyzer, $logTable) {
+    $tables = $analyzer->getTables();
+    // A log table that is gone (or logging was disabled) has nothing to wait for.
+    if (isset($tables[$logTable]) && $analyzer->analyzeTable($logTable, $tables[$logTable])['needs_change']) {
+      throw new CRM_Core_Exception(E::ts('Not converted, because its log table %1 did not convert in this run (see its log entry). The logging trigger would still reject 4-byte characters. Fix the log table, then convert this table again.', [1 => $logTable]));
     }
   }
 

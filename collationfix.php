@@ -48,6 +48,31 @@ function collationfix_civicrm_enable(): void {
 }
 
 /**
+ * Implements hook_civicrm_pageRun().
+ *
+ * Older core queue runners parse error responses as JSON unconditionally.
+ * Limit our transport-error handling to this extension's configured runner.
+ */
+function collationfix_civicrm_pageRun(&$page): void {
+  if (!$page instanceof CRM_Queue_Page_Runner) {
+    return;
+  }
+  $data = $page->getTemplateVars('queueRunnerData');
+  $prefix = CRM_Collationfix_Converter::QUEUE_NAME_PREFIX . '_';
+  if (!is_array($data) || strpos((string) ($data['qrid'] ?? ''), $prefix) !== 0) {
+    return;
+  }
+  CRM_Core_Resources::singleton()
+    ->addVars('collationfixRunner', [
+      'qrid' => $data['qrid'],
+      'urls' => [$data['runNextAjax'], $data['skipNextAjax'], $data['onEndAjax']],
+      'logUrl' => CRM_Utils_System::url('civicrm/admin/collationfix/log', 'reset=1'),
+      'analysisUrl' => CRM_Utils_System::url('civicrm/admin/collationfix', 'reset=1'),
+    ])
+    ->addScriptFile(E::LONG_NAME, 'js/queue-runner.js');
+}
+
+/**
  * Implements hook_civicrm_navigationMenu().
  *
  * Adds "Collation Fix" and its settings page under Administer > System Settings.

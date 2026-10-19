@@ -303,8 +303,9 @@ class CRM_Collationfix_Analyzer {
   }
 
   /**
-   * SQL identifier for a table key, qualified with its database when that is
-   * not the CiviCRM database.
+   * SQL identifier for a table key, always qualified with its database, so a
+   * statement reviewed, downloaded or copied from this tool cannot alter a
+   * table of the same name in whichever database a client has selected.
    *
    * @param string $key
    *
@@ -312,8 +313,7 @@ class CRM_Collationfix_Analyzer {
    */
   protected function quoteTable($key) {
     [$schema, $name] = $this->splitTableKey($key);
-    $quoted = '`' . str_replace('`', '``', $name) . '`';
-    return $schema === $this->database ? $quoted : '`' . str_replace('`', '``', $schema) . '`.' . $quoted;
+    return '`' . str_replace('`', '``', $schema) . '`.`' . str_replace('`', '``', $name) . '`';
   }
 
   /**
@@ -329,6 +329,22 @@ class CRM_Collationfix_Analyzer {
     }
     [$schema, $name] = $this->splitTableKey($key);
     return $schema === $this->getLoggingDatabaseName() && isset($this->getLogTableNames()[$name]);
+  }
+
+  /**
+   * Key of the log table of a table, while detailed logging is enabled and
+   * the table has one.
+   *
+   * @param string $key
+   *
+   * @return string|null
+   */
+  public function getLogTableKey($key) {
+    if (!$this->isLoggingEnabled() || $this->isLogTable($key)) {
+      return NULL;
+    }
+    $logKey = $this->getTableKey($this->getLoggingDatabaseName(), 'log_' . $key);
+    return $this->isLogTable($logKey) ? $logKey : NULL;
   }
 
   /**
@@ -359,6 +375,14 @@ class CRM_Collationfix_Analyzer {
    *   - table, engine, current_collation, target_collation
    *   - database, is_log, base_table: the table's database, whether it is a
    *     log table, and for a log table the table it logs
+   *   - status: blocked; legacy (utf8/utf8mb3 to convert); collation (only
+   *     another utf8mb4 collation to change); ok (matches the target); or
+   *     out_of_scope (nothing to convert, but a character set other than
+   *     UTF-8, such as latin1, is in use)
+   *   - other_charsets: the table default and columns on a character set
+   *     other than UTF-8, which are never converted
+   *   - exceeds_index_limit: an index will be over the InnoDB key limit once
+   *     converted, so the ALTER will fail
    *   - size_bytes, size_formatted, row_count
    *   - columns: list of columns needing change
    *   - skipped_columns: columns whose definitions cannot be converted safely
@@ -433,11 +457,8 @@ class CRM_Collationfix_Analyzer {
     }
     $tables = $this->getTables();
     foreach ($analysis as $key => $item) {
-      if ($item['is_log']) {
-        continue;
-      }
-      $logKey = $this->getTableKey($this->getLoggingDatabaseName(), 'log_' . $key);
-      if (isset($tables[$logKey]) && !isset($analysis[$logKey])
+      $logKey = $this->getLogTableKey($key);
+      if ($logKey !== NULL && isset($tables[$logKey]) && !isset($analysis[$logKey])
         && $this->analyzeTable($logKey, $tables[$logKey])['needs_change']) {
         $missing[$key] = $logKey;
       }
@@ -480,6 +501,9 @@ class CRM_Collationfix_Analyzer {
       'warnings' => [],
       'blocked' => FALSE,
       'errors' => [],
+      'status' => 'ok',
+      'other_charsets' => [],
+      'exceeds_index_limit' => FALSE,
       'schema_fingerprint' => '',
       'row_format' => (string) ($meta['Row_format'] ?? ''),
       'needs_change' => FALSE,
@@ -497,10 +521,14 @@ class CRM_Collationfix_Analyzer {
     }
     catch (Exception $e) {
       $item['blocked'] = $item['needs_change'] = TRUE;
+      $item['status'] = 'blocked';
       $item['errors'][] = $e->getMessage();
       return $item;
     }
     $definitions = NULL;
+    // Whether anything is still on 3-byte utf8, rather than only on another
+    // utf8mb4 collation.
+    $hasLegacy = FALSE;
     $definitionOf = function ($field) use ($table, $createTable, &$definitions) {
       if ($definitions === NULL) {
         $definitions = $this->getColumnDefinitions($table, $createTable);
@@ -523,9 +551,12 @@ class CRM_Collationfix_Analyzer {
       }
 
       // Only convert utf8 family (utf8_*, utf8mb3_*, other utf8mb4_* variants).
+      // Other character sets (latin1 etc.) are reported, never converted.
       if (strpos($collation, 'utf8') !== 0) {
+        $item['other_charsets'][] = "{$dao->Field} ({$collation})";
         continue;
       }
+      $hasLegacy = $hasLegacy || strpos($collation, self::NEW_CHARSET) !== 0;
 
       // Preserve binary collations as binary.
       $columnCollation = (strpos($collation, '_bin') !== FALSE)
@@ -606,6 +637,10 @@ class CRM_Collationfix_Analyzer {
       ? self::NEW_BINARY_COLLATION
       : $this->targetCollation;
     $item['target_collation'] = $tableIsUtf8 ? $tableCollation : $meta['Collation'];
+    if (!$tableIsUtf8) {
+      array_unshift($item['other_charsets'], E::ts('table default (%1)', [1 => $meta['Collation']]));
+    }
+    $hasLegacy = $hasLegacy || ($tableIsUtf8 && strpos((string) $meta['Collation'], self::NEW_CHARSET) !== 0);
 
     // InnoDB tables move to the Dynamic row format for its 3072-byte index
     // key limit. Compressed tables already have that limit, and switching
@@ -616,14 +651,21 @@ class CRM_Collationfix_Analyzer {
 
     if ($item['errors']) {
       $item['blocked'] = $item['needs_change'] = TRUE;
+      $item['status'] = 'blocked';
       return $item;
     }
 
     if (empty($modifyClauses) && (!$tableIsUtf8 || $meta['Collation'] === $tableCollation)) {
+      // Nothing this tool converts; a non-UTF-8 charset is not "OK" though.
+      $item['status'] = $item['other_charsets'] ? 'out_of_scope' : 'ok';
       return $item;
     }
 
     $item['needs_change'] = TRUE;
+    $item['status'] = $hasLegacy ? 'legacy' : 'collation';
+    if ($item['other_charsets']) {
+      $item['warnings'][] = E::ts('Not converted, because they use a character set other than UTF-8: %1. They still cannot store 4-byte characters; convert them separately.', [1 => implode(', ', $item['other_charsets'])]);
+    }
     if ($meta['Engine'] === 'ARCHIVE') {
       $item['warnings'][] = E::ts('ARCHIVE engine: the ALTER rewrites the whole table, which is slow for a large log table. To move log tables to InnoDB first, run the System.updatelogtables API with forceEngineMigration=1.');
     }
@@ -1059,6 +1101,7 @@ class CRM_Collationfix_Analyzer {
         }
         $limit = $this->getIndexKeyLimit($result[$table]['row_format']);
         if ($bytes > $limit) {
+          $result[$table]['exceeds_index_limit'] = TRUE;
           $result[$table]['warnings'][] = E::ts(
             'Index %1 will need at least %2 bytes once converted, over the %3-byte InnoDB index key limit. Review its columns and prefix lengths before converting.',
             [1 => $name, 2 => $bytes, 3 => $limit]

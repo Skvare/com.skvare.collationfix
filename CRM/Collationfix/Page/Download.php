@@ -29,6 +29,8 @@ class CRM_Collationfix_Page_Download extends CRM_Core_Page {
       '-- Target collation: ' . $analyzer->getTargetCollation(),
       '-- Tables: ' . ($tables === NULL ? 'all that need a change' : 'selected on the analysis page'),
       '-- Generated: ' . date('Y-m-d H:i:s'),
+      '-- Every statement names its database, so it alters only these tables',
+      '-- whichever database the client has selected.',
       '-- Review before running. Take a backup first.',
       '',
     ];

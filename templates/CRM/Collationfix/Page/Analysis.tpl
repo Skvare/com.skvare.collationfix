@@ -1,4 +1,13 @@
 {* Collation Fix - analysis page *}
+{* Status badge colours, shared by the legend and the Status column. *}
+<style>
+  .collationfix-analysis .collationfix-badge-blocked {ldelim} background:#fdd; {rdelim}
+  .collationfix-analysis .collationfix-badge-legacy {ldelim} background:#ffd; {rdelim}
+  .collationfix-analysis .collationfix-badge-collation {ldelim} background:#e3ecff; {rdelim}
+  .collationfix-analysis .collationfix-badge-ok {ldelim} background:#dfe; {rdelim}
+  .collationfix-analysis .collationfix-badge-out_of_scope {ldelim} background:#e6e6e6; {rdelim}
+  .collationfix-analysis .collationfix-badge-warning {ldelim} background:#fde2b8; {rdelim}
+</style>
 <div class="crm-block crm-content-block collationfix-analysis">
 
   <div class="messages status no-popup">
@@ -36,27 +45,35 @@
         </table>
       {/if}
 
-      {* Legend for the Status column. Keep the badges identical to the ones in the table below. *}
+      {* Legend for the Status column; the badges use the same classes as the table below. *}
       <table class="report-layout collationfix-legend" style="width:auto; max-width:32em; margin:0.5em 0;">
         <thead>
           <tr><th>{ts}Status{/ts}</th><th>{ts}What it means{/ts}</th></tr>
         </thead>
         <tbody>
           <tr>
-            <td><span class="crm-tag-item" style="background:#fdd;">{ts}Blocked{/ts}</span></td>
+            <td><span class="crm-tag-item collationfix-badge-legacy">{ts}Legacy utf8{/ts}</span></td>
+            <td>{ts}Still on 3-byte utf8, so it cannot store emoji. Converted when selected.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item collationfix-badge-collation">{ts}Other collation{/ts}</span></td>
+            <td>{ts}Already utf8mb4, but on another collation. Converted to the target collation when selected, so joins between tables match.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item collationfix-badge-ok">{ts}OK{/ts}</span></td>
+            <td>{ts}Matches the target collation; nothing to do. Hidden unless you untick "Hide tables that are already utf8mb4".{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item collationfix-badge-out_of_scope">{ts}Out of scope{/ts}</span></td>
+            <td>{ts}Uses another character set, such as latin1, which this tool does not convert. It cannot store emoji either; convert it separately. Open Details for which parts.{/ts}</td>
+          </tr>
+          <tr>
+            <td><span class="crm-tag-item collationfix-badge-blocked">{ts}Blocked{/ts}</span></td>
             <td>{ts}Cannot be converted safely, so no SQL is generated and it cannot be selected. Open Details for the reason.{/ts}</td>
           </tr>
           <tr>
-            <td><span class="crm-tag-item" style="background:#fdd;">{ts}Warning{/ts}</span></td>
-            <td>{ts}Will be converted when selected, but read the warnings under Details first, such as an index that becomes too long, a large table, or a log table to convert with it.{/ts}</td>
-          </tr>
-          <tr>
-            <td><span class="crm-tag-item" style="background:#ffd;">{ts}Needs change{/ts}</span></td>
-            <td>{ts}Will be converted when selected. Nothing to flag.{/ts}</td>
-          </tr>
-          <tr>
-            <td><span class="crm-tag-item" style="background:#dfe;">{ts}OK{/ts}</span></td>
-            <td>{ts}Already on the target collation; nothing to do. Hidden unless you untick "Hide tables that are already utf8mb4".{/ts}</td>
+            <td><span class="crm-tag-item collationfix-badge-warning">{ts}Warning{/ts}</span></td>
+            <td>{ts}Shown beside the status when there is something to read under Details first, such as an index that becomes too long, a large table, or a log table to convert with it.{/ts}</td>
           </tr>
           {if $loggingEnabled}
             <tr>
@@ -131,7 +148,7 @@
       </thead>
       <tbody>
         {foreach from=$analysis key=table item=item}
-          <tr class="collationfix-row {if !$item.needs_change}collationfix-ok{/if} {cycle values='odd-row,even-row'}">
+          <tr class="collationfix-row {if $item.status eq 'ok'}collationfix-ok{/if} {cycle values='odd-row,even-row'}">
             <td>
               {if $item.needs_change and !$item.blocked}
                 <input type="checkbox" name="tables[]" value="{$table|escape}" class="collationfix-check" checked/>
@@ -143,23 +160,18 @@
             <td>{$item.columns|@count}</td>
             <td>{$item.size_formatted|escape}</td>
             <td>
-              {if $item.blocked}
-                <span class="crm-tag-item" style="background:#fdd;">{ts}Blocked{/ts}</span>
-              {elseif !$item.needs_change}
-                <span class="crm-tag-item" style="background:#dfe;">{ts}OK{/ts}</span>
-              {elseif $item.warnings}
-                <span class="crm-tag-item" style="background:#fdd;">{ts}Warning{/ts}</span>
-              {else}
-                <span class="crm-tag-item" style="background:#ffd;">{ts}Needs change{/ts}</span>
+              <span class="crm-tag-item collationfix-badge-{$item.status}">{if $item.status eq 'blocked'}{ts}Blocked{/ts}{elseif $item.status eq 'legacy'}{ts}Legacy utf8{/ts}{elseif $item.status eq 'collation'}{ts}Other collation{/ts}{elseif $item.status eq 'out_of_scope'}{ts}Out of scope{/ts}{else}{ts}OK{/ts}{/if}</span>
+              {if $item.warnings}
+                <span class="crm-tag-item collationfix-badge-warning">{ts}Warning{/ts}</span>
               {/if}
             </td>
             <td>
-              {if $item.needs_change}
+              {if $item.needs_change or $item.other_charsets}
                 <a href="#" class="collationfix-toggle" data-target="collationfix-detail-{$table|escape}">{ts}Details{/ts}</a>
               {/if}
             </td>
           </tr>
-          {if $item.needs_change}
+          {if $item.needs_change or $item.other_charsets}
             <tr id="collationfix-detail-{$table|escape}" class="collationfix-detail" style="display:none;">
               <td></td>
               <td colspan="7">
@@ -177,6 +189,15 @@
                     {/foreach}
                   </div>
                 {/if}
+                {if !$item.needs_change and $item.other_charsets}
+                  <div class="messages status no-popup">
+                    <p>{ts}Not converted, because they use a character set other than UTF-8. They cannot store 4-byte characters; convert them separately{/ts}:
+                    {foreach from=$item.other_charsets item=part name=charsetloop}
+                      <code>{$part|escape}</code>{if !$smarty.foreach.charsetloop.last}, {/if}
+                    {/foreach}
+                    </p>
+                  </div>
+                {/if}
                 {if $item.skipped_columns}
                   <div class="messages status no-popup">
                     <p>{ts}Skipped columns{/ts}:
@@ -186,6 +207,7 @@
                     </p>
                   </div>
                 {/if}
+                {if $item.needs_change}
                 <table class="form-layout-compressed">
                   <thead>
                     <tr><th>{ts}Column{/ts}</th><th>{ts}Type{/ts}</th><th>{ts}Current{/ts}</th><th>{ts}Target{/ts}</th></tr>
@@ -203,6 +225,7 @@
                 </table>
                 <strong>{ts}Generated statement{/ts}:</strong>
                 <pre class="collationfix-sql" style="white-space:pre-wrap; background:#f6f6f6; padding:8px; border:1px solid #ddd;">{$item.alter|escape}</pre>
+                {/if}
               </td>
             </tr>
           {/if}

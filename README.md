@@ -26,6 +26,13 @@ alternative:
   with its quotes escaped a second time.
 * **Dry run by default** — the analysis page never touches the database.
   Review the exact ALTER statement for every table before anything runs.
+  Every statement names its database (`` `db`.`table` ``), so a downloaded
+  file alters only those tables, whichever database the client has selected.
+* **Clear statuses** — each table is marked *Legacy utf8* (still 3-byte),
+  *Other collation* (utf8mb4 on another collation), *OK* (matches the
+  target), *Out of scope* (uses another character set, such as latin1, which
+  is not converted) or *Blocked*, with a separate *Warning* badge when there
+  is something to read first. A legend on the analysis page explains them.
 * **Pre-flight warnings** — large tables (lock duration), and indexes whose
   key would exceed the InnoDB limit once their columns take 4 bytes per
   character (the ALTER would fail). The limit accounts for row format,
@@ -92,7 +99,8 @@ This is an [extension for CiviCRM](https://docs.civicrm.org/sysadmin/en/latest/c
    `utf8mb4_bin`.
 4. Review the analysis: expand any table to see the per-column diff and the
    exact ALTER statement. Warnings are shown for large tables and risky
-   indexes.
+   indexes, and again on the confirmation screen, which also lists tables
+   whose ALTER will fail on the index key limit.
 5. Select tables, then either click **Download selected as .sql** to run the
    statements manually, or **Review and convert selected tables**.
 6. On the confirmation screen, type the database name to enable execution.
@@ -130,7 +138,9 @@ with `Incorrect string value` (or, without strict SQL mode, the log stores
   its log table needs it too, and the confirmation screen lists selected
   tables whose log table is not selected. Log tables are always converted
   first, which is safe: a log table on utf8mb4 accepts everything a utf8
-  table sends it.
+  table sends it. When a table and its log table are in the same run (UI
+  queue or API call) and the log table fails, the table is left unchanged
+  and recorded as an error; unrelated tables carry on.
 * **Locking.** While a log table's ALTER runs, saves to the table it logs
   wait for it, because the trigger writes to the log table. Log tables are
   often the largest tables in the database; convert them from the command
@@ -176,6 +186,26 @@ wp civicrm api Collationfix.convert tables=civicrm_contact
 its table; large tables can take several minutes and will cause replication
 lag on replicated setups.
 
+## Interrupted browser conversions
+
+If the queue request returns an empty, truncated or non-JSON response, the
+runner pauses with the HTTP status, elapsed time and links to the audit log
+and analysis. This avoids the core runner's secondary `Unexpected end of
+JSON input` error. It does not remove web-server or proxy timeouts.
+
+The ALTER may still be running, or may have completed after the browser lost
+its response. Check the conversion log and database activity before starting
+another run. A `running` audit record alone cannot tell you whether the query
+is still active. Once no conversion is running, re-analyze and review the
+remaining tables; use the command-line API above for long conversions.
+
+To diagnose the original failure, inspect the browser Network entry for
+`queue/ajax/runNext` (HTTP status, duration and response), and the PHP and
+web-server logs at the same time. A timeout, a terminated PHP worker or a
+lost connection can all prevent a usable response. The JavaScript error
+alone does not identify which occurred. Raising PHP's execution limit alone
+does not change PHP-FPM, web-server or proxy request limits.
+
 ## Scope / Known Issues
 
 * Operates on the database `CIVICRM_DSN` connects to, and only on tables
@@ -199,7 +229,9 @@ lag on replicated setups.
   `NO_BACKSLASH_ESCAPES`.
 * Converts the utf8 family only (`utf8`, `utf8mb3`, and normalizes other
   `utf8mb4_*` variants to the configured target collation); latin1 and
-  other charsets are left untouched.
+  other charsets are left untouched. Tables using them are marked *Out of
+  scope* rather than *OK*, and such columns in a table that is converted
+  are listed in its warnings.
 * Schema conversion only — it does not repair mojibake or double-encoded
   data.
 * Schema checks detect changes since review; they do not lock the schema
@@ -215,7 +247,13 @@ Run `php tests/regression.php` from the extension directory. These standalone
 tests simulate CiviCRM and database responses and never connect to a database.
 They cover SQL parsing, blocked tables, schema drift, queue/form review state,
 audit ordering, verification failures, API results, composite index sizes,
-and detailed-logging tables (logging on/off, separate logging database,
-ARCHIVE log tables, conversion order and the scope report).
+detailed-logging tables (logging on/off, separate logging database,
+ARCHIVE log tables, conversion order, the scope report, and leaving a table
+unchanged when its log table fails), table statuses, database-qualified
+statements and the confirmation screen's warnings.
 They complement, rather than replace, conversion tests on disposable MySQL
 and MariaDB databases.
+
+Run `php tests/queue-runner.php` and `node tests/queue-runner.js` for the
+runner hook and response-handling checks. These do not connect to a database
+or execute conversions.

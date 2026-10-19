@@ -40,8 +40,8 @@
             </td>
             <td>{$row.display_name|escape}</td>
             <td>
-              {if $row.statement}
-                <a href="#" class="collationfix-log-toggle" data-target="collationfix-log-{$row.id|escape}">{ts}SQL{/ts}</a>
+              {if $row.statement or $row.error_message}
+                <a href="#" class="collationfix-log-toggle" data-target="collationfix-log-{$row.id|escape}">{ts}Details{/ts}</a>
               {/if}
             </td>
           </tr>

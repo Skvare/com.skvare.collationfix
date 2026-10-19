@@ -70,13 +70,21 @@ class CRM_Collationfix_Form_Convert extends CRM_Core_Form {
 
     $totalBytes = 0;
     $hasLogTables = FALSE;
-    foreach ($analysis as $item) {
+    $warningCount = 0;
+    $indexLimitTables = [];
+    foreach ($analysis as $table => $item) {
       if ($item['blocked']) {
         throw new CRM_Core_Exception(E::ts('Conversion of %1 is blocked: %2', [1 => $item['table'], 2 => implode(' ', $item['errors'])]));
       }
       $totalBytes += $item['size_bytes'];
       $hasLogTables = $hasLogTables || $item['is_log'];
+      $warningCount += (int) !empty($item['warnings']);
+      if ($item['exceeds_index_limit']) {
+        $indexLimitTables[] = $table;
+      }
     }
+    $this->assign('warningCount', $warningCount);
+    $this->assign('indexLimitTables', $indexLimitTables);
 
     $this->assign('tables', $analysis);
     $this->assign('tableCount', count($this->_tables));

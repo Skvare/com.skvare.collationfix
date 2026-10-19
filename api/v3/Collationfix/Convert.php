@@ -61,6 +61,7 @@ function civicrm_api3_collationfix_convert($params) {
         'table_name' => $table,
         'database' => $item['database'],
         'is_log' => $item['is_log'],
+        'status' => $item['status'],
         'needs_change' => $item['needs_change'],
         'blocked' => $item['blocked'],
         'errors' => $item['errors'],
@@ -77,12 +78,14 @@ function civicrm_api3_collationfix_convert($params) {
   }
 
   // Like the UI queue, carry on past a failed table, and convert log tables
-  // first; report failures at the end so CLI callers get a non-zero exit.
-  // Every table converts to the target collation read at the start of the
-  // call.
+  // first; a table whose log table failed in this call is left unchanged.
+  // Report failures at the end so CLI callers get a non-zero exit. Every
+  // table converts to the target collation read at the start of the call.
   $failed = [];
   foreach ($analyzer->orderForConversion($tables) as $table) {
-    $values[$table] = CRM_Collationfix_Converter::convertTable($table, $analyzer->getTargetCollation());
+    $logTable = $analyzer->getLogTableKey($table);
+    $values[$table] = CRM_Collationfix_Converter::convertTable($table, $analyzer->getTargetCollation(), NULL,
+      in_array($logTable, $tables, TRUE) ? $logTable : NULL);
     if ($values[$table]['status'] === 'error') {
       $failed[] = $table;
     }
